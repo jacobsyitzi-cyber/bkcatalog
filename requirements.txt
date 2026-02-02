@@ -1,0 +1,8 @@
+streamlit
+pandas
+requests
+reportlab
+pillow
+svglib
+urllib3
+pymupdf
