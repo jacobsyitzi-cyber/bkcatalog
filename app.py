@@ -1,58 +1,5 @@
-# app.py
-# B-Kosher Customer Catalog Builder (WooCommerce)
-#
-# ✅ Streamlit Cloud friendly build (NO svglib / NO lxml)
-# ✅ Uses PNG logo (bkosher.png) for app + PDF header
-# ✅ Password login page first (password stored in Streamlit Secrets)
-# ✅ WooCommerce API credentials stored in Streamlit Secrets (no re-typing)
-# ✅ Data source: CSV upload OR WooCommerce API
-# ✅ API caching:
-#    - Disk cache (api_cache/products.json) for fast loads
-#    - Streamlit cache (st.cache_data) to avoid repeat work per session
-#    - Refresh button to force re-fetch
-# ✅ API fetch hardened:
-#    - requests.Session + HTTP retries + SSL/connection retries + polite paging delay
-#    - NEVER prints consumer_key/consumer_secret in any error message
-# ✅ PDF: NO FRONT COVER (starts with Contents page)
-# ✅ PDF: 3x3 on A4 when columns=3
-# ✅ Clickable product cards (opens product URL)
-# ✅ Sale badge + Save £X (Y%) + regular price struck-through
-# ✅ Optional attributes, description, SKU
-# ✅ Reliable image downloading: disk cache + retries/backoff + presets
-# ✅ Clean text: converts &amp; -> &, strips HTML, avoids "nan"
-# ✅ Preview first N pages if PyMuPDF installed (optional)
-#
-# -------------------------------
-# REQUIRED FILES IN REPO ROOT
-# -------------------------------
-# - app.py
-# - bkosher.png   (PNG version of your logo)
-#
-# -------------------------------
-# requirements.txt (Streamlit Cloud safe)
-# -------------------------------
-# streamlit==1.31.1
-# pandas==2.1.4
-# requests==2.31.0
-# Pillow==10.2.0
-# reportlab==3.6.13
-# urllib3==2.1.0
-#
-# Optional preview:
-# pymupdf==1.23.26
-#
-# runtime.txt (recommended):
-# python-3.11
-#
-# -------------------------------
-# LOCAL SECRETS SETUP
-# -------------------------------
-# .streamlit/secrets.toml (LOCAL ONLY; don't commit)
-#
-# WC_URL = "https://b-kosher.co.uk"
-# WC_CK  = "ck_..."
-# WC_CS  = "cs_..."
-# APP_PASSWORD = "Bkosher1234!"
+# app.py (NO pandas)
+# Streamlit Cloud build-proof version
 
 import io
 import re
@@ -60,14 +7,13 @@ import time
 import math
 import json
 import html
-import base64
 import hashlib
 import datetime
+import csv
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
@@ -81,7 +27,7 @@ from reportlab.lib.utils import ImageReader, simpleSplit
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Optional PDF preview
+# Optional PDF preview (ONLY if you add pymupdf to requirements)
 try:
     import fitz  # PyMuPDF
     HAS_PYMUPDF = True
@@ -90,7 +36,7 @@ except ModuleNotFoundError:
 
 
 # =========================
-# APP CONFIG + BRAND
+# CONFIG
 # =========================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
@@ -103,7 +49,9 @@ DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-LOGO_PNG_PATH = "bkosher.png"  # <-- put this PNG in your repo root
+# Change this to your exact file name in GitHub repo:
+# LOGO_PNG_PATH = "bkosher.png"
+LOGO_PNG_PATH = "bkosher.png"
 
 st.markdown(
     f"""
@@ -180,7 +128,7 @@ st.markdown(
 
 
 # =========================
-# SECRETS + LOGIN GATE
+# SECRETS + LOGIN
 # =========================
 def get_secret(name: str, default: str = "") -> str:
     try:
@@ -210,16 +158,13 @@ def login_gate():
     st.write("Please enter the password to continue.")
     pw = st.text_input("Password", type="password")
 
-    c1, c2 = st.columns([1, 2])
-    with c1:
-        if st.button("Login"):
-            if pw == APP_PASSWORD:
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Incorrect password.")
-    with c2:
-        st.caption("If you don’t have access, please contact B-Kosher.")
+    if st.button("Login"):
+        if pw == APP_PASSWORD:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+
     st.stop()
 
 
@@ -227,7 +172,7 @@ login_gate()
 
 
 # =========================
-# URL sanitizer (NO KEY LEAKS)
+# Helpers
 # =========================
 def sanitize_url(u: str) -> str:
     try:
@@ -240,32 +185,9 @@ def sanitize_url(u: str) -> str:
         return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
 
 
-# =========================
-# App logo helpers (PNG)
-# =========================
-def render_logo_png_in_app(path: str, width: int = 200):
-    try:
-        st.image(path, width=width)
-    except Exception:
-        st.caption("Logo missing: add bkosher.png to the repo root.")
-
-
-@st.cache_resource(show_spinner=False)
-def load_logo_png_reader(path: str):
-    return ImageReader(path)
-
-
-# =========================
-# Data helpers
-# =========================
 def safe_text(v) -> str:
     if v is None:
         return ""
-    try:
-        if pd.isna(v):
-            return ""
-    except Exception:
-        pass
     s = str(v).strip()
     if s.lower() in ("nan", "none", "null"):
         return ""
@@ -327,14 +249,6 @@ def wrap_with_ellipsis(text: str, font_name: str, font_size: float, max_width: f
     return kept
 
 
-def pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    lowered = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lowered:
-            return lowered[cand.lower()]
-    return None
-
-
 def primary_category(p: dict) -> str:
     cats = p.get("categories") or []
     if isinstance(cats, list) and cats:
@@ -344,9 +258,7 @@ def primary_category(p: dict) -> str:
 
 def is_in_stock(p: dict) -> bool:
     s = safe_text(p.get("stock_status")).lower()
-    if s == "outofstock":
-        return False
-    return True
+    return s != "outofstock"
 
 
 def effective_price(p: dict) -> float | None:
@@ -357,8 +269,20 @@ def effective_price(p: dict) -> float | None:
     return reg
 
 
+@st.cache_resource(show_spinner=False)
+def load_logo_png_reader(path: str):
+    return ImageReader(path)
+
+
+def render_logo_png_in_app(path: str, width: int = 200):
+    try:
+        st.image(path, width=width)
+    except Exception:
+        st.caption("Logo missing: add your PNG file to the repo root.")
+
+
 # =========================
-# Disk caches (images + api)
+# Caches
 # =========================
 CACHE_DIR = Path("./image_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -404,13 +328,13 @@ def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> by
         return None
 
 
-def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float) -> tuple[bytes | None, str]:
+def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float) -> bytes | None:
     if not url or not url.startswith("http"):
-        return None, "permanent"
+        return None
 
     cached = read_image_cache(url)
     if cached:
-        return cached, "ok"
+        return cached
 
     for attempt in range(retries + 1):
         if attempt > 0:
@@ -418,7 +342,7 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
         try:
             r = requests.get(url, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
             if r.status_code == 404:
-                return None, "permanent"
+                return None
             if r.status_code in (429, 500, 502, 503, 504):
                 continue
             r.raise_for_status()
@@ -426,11 +350,11 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             cooked = resize_to_jpeg_bytes(raw)
             final = cooked if cooked else raw
             write_image_cache(url, final)
-            return final, "ok"
+            return final
         except Exception:
             continue
 
-    return None, "temporary"
+    return None
 
 
 def bytes_to_pil(b: bytes) -> Image.Image | None:
@@ -466,23 +390,11 @@ def api_cache_save(products_raw: list[dict]):
 
 
 # =========================
-# WooCommerce API fetch (HARDENED)
+# Woo API
 # =========================
-def wc_fetch_products(
-    base_url: str,
-    ck: str,
-    cs: str,
-    *,
-    per_page: int = 25,
-    timeout: int = 30,
-    status: str = "publish",
-    log_cb=None,
-    max_pages: int = 10000,
-    polite_delay_every: int = 10,
-    polite_delay_sec: float = 0.3,
-):
+def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, timeout: int = 30):
     if not (base_url and ck and cs):
-        raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in secrets.toml (or Streamlit Cloud Secrets).")
+        raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
     base_url = base_url.rstrip("/")
     endpoint = f"{base_url}/wp-json/wc/v3/products"
@@ -504,28 +416,18 @@ def wc_fetch_products(
     ssl_retries = 8
 
     while True:
-        if page > max_pages:
-            raise RuntimeError(f"Stopped: exceeded max_pages={max_pages}. Check pagination.")
-
         params = {
             "consumer_key": ck,
             "consumer_secret": cs,
             "per_page": per_page,
             "page": page,
-            "status": status,
+            "status": "publish",
         }
-
-        if log_cb:
-            log_cb(f"Fetching API page {page} (per_page={per_page})…")
 
         last_exc = None
         for attempt in range(ssl_retries + 1):
             if attempt > 0:
-                sleep_s = min(0.8 * (2 ** (attempt - 1)), 20.0)
-                if log_cb:
-                    log_cb(f"Connection hiccup — retry {attempt}/{ssl_retries} after {sleep_s:.1f}s…")
-                time.sleep(sleep_s)
-
+                time.sleep(min(0.8 * (2 ** (attempt - 1)), 20.0))
             try:
                 r = session.get(endpoint, params=params, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
 
@@ -534,25 +436,22 @@ def wc_fetch_products(
                         j = r.json()
                         raise RuntimeError(f"{j.get('code')} ({r.status_code}): {j.get('message')}")
                     except Exception:
-                        raise RuntimeError(f"Unauthorized ({r.status_code}). Check Woo REST API key permissions.")
+                        raise RuntimeError(f"Unauthorized ({r.status_code}). Check Woo REST API permissions.")
 
                 if r.status_code >= 400:
-                    safe_u = sanitize_url(r.url)
-                    raise RuntimeError(f"API request failed ({r.status_code}) at {safe_u}")
+                    raise RuntimeError(f"API request failed ({r.status_code}) at {sanitize_url(r.url)}")
 
                 batch = r.json()
                 if not batch:
                     return out
 
                 out.extend(batch)
-
-                if polite_delay_every and page % polite_delay_every == 0:
-                    time.sleep(polite_delay_sec)
-
                 if len(batch) < per_page:
                     return out
 
                 page += 1
+                if page % 10 == 0:
+                    time.sleep(0.3)
                 last_exc = None
                 break
 
@@ -561,16 +460,15 @@ def wc_fetch_products(
                 continue
 
         if last_exc is not None:
-            raise RuntimeError(
-                "API fetch failed due to repeated SSL/connection errors while paging products. "
-                "Try: (1) set WC_URL without 'www', (2) lower per_page, (3) wait and retry, "
-                "or (4) use the disk cache if already created.\n"
-                f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
-            )
+            raise RuntimeError(f"API fetch failed (connection issues). Details: {type(last_exc).__name__}: {str(last_exc)[:200]}")
 
 
 def wc_to_product(p: dict) -> dict:
-    cats = [safe_text(c.get("name")) for c in (p.get("categories") or []) if safe_text(c.get("name"))]
+    cats = []
+    for c in (p.get("categories") or []):
+        n = safe_text(c.get("name"))
+        if n:
+            cats.append(n)
 
     attrs = []
     for a in (p.get("attributes") or []):
@@ -606,17 +504,8 @@ def wc_to_product(p: dict) -> dict:
     }
 
 
-# =========================
-# Cached API loader (disk + st.cache_data)
-# =========================
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_products_from_api_or_cache(
-    wc_url: str,
-    wc_ck: str,
-    wc_cs: str,
-    timeout: int = 30,
-    force_refresh: bool = False,
-):
+def get_products_from_api_or_cache(wc_url: str, wc_ck: str, wc_cs: str, timeout: int = 30, force_refresh: bool = False):
     if not force_refresh:
         cached_raw, fetched_at = api_cache_load()
         if cached_raw is not None:
@@ -631,7 +520,7 @@ def get_products_from_api_or_cache(
 
 
 # =========================
-# PDF preview
+# PDF Preview (optional)
 # =========================
 def pdf_preview_images(pdf_bytes: bytes, max_pages: int = 2, zoom: float = 1.35) -> list[bytes]:
     if not HAS_PYMUPDF:
@@ -649,7 +538,7 @@ def pdf_preview_images(pdf_bytes: bytes, max_pages: int = 2, zoom: float = 1.35)
 
 
 # =========================
-# PDF generator (NO COVER)
+# PDF builder (NO cover)
 # =========================
 def make_catalog_pdf(
     products: list[dict],
@@ -672,7 +561,7 @@ def make_catalog_pdf(
     gutter = 6 * mm
     header_h = 16 * mm
     footer_h = 14 * mm
-    category_bar_h = 18  # points
+    category_bar_h = 18
 
     pdf = io.BytesIO()
     c = canvas.Canvas(pdf, pagesize=pagesize)
@@ -680,7 +569,6 @@ def make_catalog_pdf(
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = f"Prices correct as of {today_str}"
 
-    # Preload logo image for PDF
     logo_reader = None
     try:
         logo_reader = load_logo_png_reader(LOGO_PNG_PATH)
@@ -692,13 +580,11 @@ def make_catalog_pdf(
         c.setLineWidth(1.1)
         c.line(margin, page_h - margin - header_h + 6, page_w - margin, page_h - margin - header_h + 6)
 
-        # Draw PNG logo left
         logo_h = 11 * mm
         logo_x = margin
         logo_y = page_h - margin - (logo_h + 3)
         logo_w = 0.0
         if logo_reader is not None:
-            # Keep it conservative: wide-ish logo
             logo_w = logo_h * 3.2
             try:
                 c.drawImage(logo_reader, logo_x, logo_y, width=logo_w, height=logo_h, mask="auto")
@@ -770,7 +656,6 @@ def make_catalog_pdf(
         draw_sale_badge(x, y, card_w, card_h, p)
 
         pad = 7
-
         img_box_h = card_h * 0.48
         img_box_w = card_w - 2 * pad
         img_x = x + pad
@@ -863,9 +748,10 @@ def make_catalog_pdf(
                     line_y -= 10
                 c.setFillColor(colors.black)
 
-    # Group by category
     grouped = {}
     for p in products:
+        if exclude_oos and not is_in_stock(p):
+            continue
         grouped.setdefault(primary_category(p), []).append(p)
     categories = sorted(grouped.keys(), key=lambda s: s.lower())
 
@@ -876,16 +762,14 @@ def make_catalog_pdf(
     reserved_bottom = footer_h + 8
     usable_h_cards = page_h - margin - margin - reserved_top - reserved_bottom
 
-    # Force 3x3 on A4 when 3 columns
     if pagesize_name == "A4" and columns == 3:
         rows = 3
         card_h = (usable_h_cards - (rows - 1) * gutter) / rows
     else:
-        target = 78 * mm
-        rows = max(1, int(usable_h_cards // (target + gutter)))
+        rows = max(1, int(usable_h_cards // (78 * mm + gutter)))
         card_h = (usable_h_cards - (rows - 1) * gutter) / rows
 
-    # Contents page numbers (content starts page 2)
+    # Contents page
     page_no = 2
     cat_first_page = {}
     per_page = rows * columns
@@ -894,8 +778,7 @@ def make_catalog_pdf(
         if not items:
             continue
         cat_first_page[cat] = page_no
-        pages_for_cat = math.ceil(len(items) / per_page) if per_page else 1
-        page_no += pages_for_cat
+        page_no += math.ceil(len(items) / per_page)
 
     c.setFillColor(BRAND_BLUE)
     c.setFont("Helvetica-Bold", 20)
@@ -908,7 +791,6 @@ def make_catalog_pdf(
     y = page_h - margin - 105
     c.setFont("Helvetica", 11)
     c.setFillColor(colors.HexColor("#111827"))
-
     for cat in categories:
         if y < margin + 80:
             c.showPage()
@@ -928,7 +810,7 @@ def make_catalog_pdf(
 
     c.showPage()
 
-    # Content
+    # Content pages
     page_no = 2
     for cat in categories:
         items = grouped[cat]
@@ -942,7 +824,6 @@ def make_catalog_pdf(
 
             start_y = page_h - margin - reserved_top - card_h
             yy = start_y
-
             for _r in range(rows):
                 xx = margin
                 for _c in range(columns):
@@ -965,7 +846,31 @@ def make_catalog_pdf(
 
 
 # =========================
-# UI state
+# CSV loader (no pandas)
+# =========================
+def read_csv_bytes(uploaded_file) -> list[dict]:
+    content = uploaded_file.getvalue()
+    # try utf-8, fallback to latin-1
+    try:
+        text = content.decode("utf-8")
+    except Exception:
+        text = content.decode("latin-1", errors="replace")
+
+    reader = csv.DictReader(io.StringIO(text))
+    rows = list(reader)
+    return rows
+
+
+def best_key(keys: list[str], candidates: list[str]) -> str | None:
+    lower = {k.lower(): k for k in keys}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    return None
+
+
+# =========================
+# Session state
 # =========================
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -989,11 +894,7 @@ with st.sidebar:
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured (secrets)")
     else:
-        st.error("Woo API secrets missing")
-
-    cached_raw, cached_at = api_cache_load()
-    if cached_raw is not None:
-        st.info(f"API cache: {len(cached_raw):,} items\n\nLast fetch: {cached_at}")
+        st.warning("Woo API secrets missing (API mode won't work)")
 
     st.markdown("---")
     if st.button("Logout"):
@@ -1028,9 +929,7 @@ def step_indicator(step: int):
     )
 
 
-# =========================
-# Step 1 — Choose data source
-# =========================
+# Step 1
 step_indicator(st.session_state.step)
 
 st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -1044,15 +943,12 @@ if st.button("Continue → Load products"):
     st.rerun()
 
 
-# =========================
-# Step 2 — Load products
-# =========================
+# Step 2
 if st.session_state.step >= 2:
     step_indicator(2)
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### Load products")
-    st.markdown('<div class="muted">API loads from disk cache instantly, unless you press refresh.</div>', unsafe_allow_html=True)
 
     if data_source == "CSV Upload":
         base_url = st.text_input("Base URL (used to build links if CSV has none)", value=DEFAULT_BASE_URL)
@@ -1060,23 +956,27 @@ if st.session_state.step >= 2:
         load_btn = st.button("Load products from CSV", disabled=(csv_file is None))
 
         if load_btn:
-            df = pd.read_csv(csv_file)
+            rows = read_csv_bytes(csv_file)
+            if not rows:
+                st.error("CSV looks empty.")
+                st.stop()
 
-            col_id = pick_col(df, ["ID", "Id"])
-            col_name = pick_col(df, ["Name", "Product name", "Title"])
-            col_sku = pick_col(df, ["SKU"])
-            col_reg = pick_col(df, ["Regular price", "Regular Price", "Price"])
-            col_sale = pick_col(df, ["Sale price", "Sale Price"])
-            col_cats = pick_col(df, ["Categories", "Category"])
-            col_desc = pick_col(df, ["Short description", "Short Description", "Description"])
-            col_imgs = pick_col(df, ["Images", "Image", "Image URLs"])
-            col_url = pick_col(df, ["Permalink", "Product URL", "URL", "Link"])
-            col_stock = pick_col(df, ["Stock status", "Stock Status", "stock_status"])
-            col_slug = pick_col(df, ["Slug", "slug"])
+            keys = list(rows[0].keys())
+            col_id = best_key(keys, ["ID", "Id"])
+            col_name = best_key(keys, ["Name", "Product name", "Title"])
+            col_sku = best_key(keys, ["SKU"])
+            col_reg = best_key(keys, ["Regular price", "Regular Price", "Price"])
+            col_sale = best_key(keys, ["Sale price", "Sale Price"])
+            col_cats = best_key(keys, ["Categories", "Category"])
+            col_desc = best_key(keys, ["Short description", "Short Description", "Description"])
+            col_imgs = best_key(keys, ["Images", "Image", "Image URLs"])
+            col_url = best_key(keys, ["Permalink", "Product URL", "URL", "Link"])
+            col_stock = best_key(keys, ["Stock status", "Stock Status", "stock_status"])
+            col_slug = best_key(keys, ["Slug", "slug"])
 
             products = []
-            for _, row in df.iterrows():
-                name = safe_text(row.get(col_name))
+            for row in rows:
+                name = safe_text(row.get(col_name)) if col_name else ""
                 if not name:
                     continue
 
@@ -1109,11 +1009,12 @@ if st.session_state.step >= 2:
                         if slug:
                             url = f"{base_url.rstrip('/')}/{slug.lstrip('/')}"
 
+                # Attributes if present in Woo export
                 attrs = []
                 for i in range(1, 21):
                     ncol = f"Attribute {i} name"
                     vcol = f"Attribute {i} value(s)"
-                    if ncol in df.columns and vcol in df.columns:
+                    if ncol in row and vcol in row:
                         n = safe_text(row.get(ncol))
                         v = safe_text(row.get(vcol))
                         if n and v:
@@ -1153,9 +1054,7 @@ if st.session_state.step >= 2:
             try:
                 with st.spinner("Loading products…"):
                     products, fetched_at, source = get_products_from_api_or_cache(
-                        WC_URL, WC_CK, WC_CS,
-                        timeout=api_timeout,
-                        force_refresh=bool(refresh_btn),
+                        WC_URL, WC_CK, WC_CS, timeout=api_timeout, force_refresh=bool(refresh_btn)
                     )
                 st.session_state.products_raw = products
                 st.session_state.step = 3
@@ -1168,26 +1067,23 @@ if st.session_state.step >= 2:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# =========================
-# Step 3 — Filter & layout
-# =========================
+# Step 3
 if st.session_state.step >= 3:
     step_indicator(3)
     products = st.session_state.products_raw
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### Filter & layout")
-    st.markdown('<div class="muted">Choose what appears in the catalog and how it looks.</div>', unsafe_allow_html=True)
 
-    g1, g2, g3 = st.columns([1.2, 1.0, 1.0])
-    with g1:
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
         st.session_state.catalog_title = st.text_input("Catalog title", value=st.session_state.get("catalog_title", DEFAULT_TITLE))
-    with g2:
-        st.session_state.pagesize_name = st.selectbox("Page size", ["A4", "Letter"], index=0 if st.session_state.get("pagesize_name", "A4") == "A4" else 1)
-        st.session_state.columns = st.selectbox("Cards per row", [1, 2, 3], index={1:0,2:1,3:2}.get(int(st.session_state.get("columns", 3)), 2))
-    with g3:
+    with c2:
+        st.session_state.pagesize_name = st.selectbox("Page size", ["A4", "Letter"], index=0)
+        st.session_state.columns = st.selectbox("Cards per row", [1, 2, 3], index=2)
+    with c3:
         st.session_state.currency_symbol = st.text_input("Currency symbol", value=st.session_state.get("currency_symbol", "£"))
-        st.session_state.preview_pages = st.selectbox("Preview pages", [1, 2, 3], index={1:0,2:1,3:2}.get(int(st.session_state.get("preview_pages", 2)), 1))
+        st.session_state.preview_pages = st.selectbox("Preview pages", [1, 2, 3], index=1)
 
     all_cats = sorted({c for p in products for c in (p.get("categories") or []) if c}, key=lambda s: s.lower())
     st.session_state.selected_cats = st.multiselect("Categories (optional)", all_cats, default=st.session_state.get("selected_cats", []))
@@ -1205,27 +1101,8 @@ if st.session_state.step >= 3:
     with t5:
         st.session_state.exclude_oos = st.checkbox("Exclude out-of-stock", value=st.session_state.get("exclude_oos", True))
 
-    st.session_state.sort_mode = st.selectbox(
-        "Sort",
-        [
-            "Category → Name",
-            "Category → Price (low→high)",
-            "Category → Price (high→low)",
-            "On sale first → Name",
-            "In stock first → Name",
-        ],
-        index=["Category → Name", "Category → Price (low→high)", "Category → Price (high→low)", "On sale first → Name", "In stock first → Name"].index(
-            st.session_state.get("sort_mode", "Category → Name")
-        ),
-    )
+    st.session_state.preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
 
-    st.session_state.preset = st.selectbox(
-        "Image download preset",
-        ["Reliable", "Normal", "Fast"],
-        index=["Reliable", "Normal", "Fast"].index(st.session_state.get("preset", "Reliable")),
-    )
-
-    # Filter
     filtered = products[:]
     if st.session_state.selected_cats:
         sset = set(st.session_state.selected_cats)
@@ -1238,31 +1115,14 @@ if st.session_state.step >= 3:
     if st.session_state.exclude_oos:
         filtered = [p for p in filtered if is_in_stock(p)]
 
-    # Sort
-    if st.session_state.sort_mode == "Category → Name":
-        filtered.sort(key=lambda p: (primary_category(p).lower(), safe_text(p.get("name")).lower()))
-    elif st.session_state.sort_mode == "Category → Price (low→high)":
-        filtered.sort(key=lambda p: (primary_category(p).lower(), (effective_price(p) is None), effective_price(p) or 1e18, safe_text(p.get("name")).lower()))
-    elif st.session_state.sort_mode == "Category → Price (high→low)":
-        filtered.sort(key=lambda p: (primary_category(p).lower(), (effective_price(p) is None), -(effective_price(p) or -1e18), safe_text(p.get("name")).lower()))
-    elif st.session_state.sort_mode == "On sale first → Name":
-        filtered.sort(key=lambda p: (not bool(p.get("on_sale")), safe_text(p.get("name")).lower()))
-    else:
-        filtered.sort(key=lambda p: (not is_in_stock(p), safe_text(p.get("name")).lower()))
-
+    filtered.sort(key=lambda p: (primary_category(p).lower(), safe_text(p.get("name")).lower()))
     st.session_state.products_filtered = filtered
-
-    missing_img_url = sum(1 for p in filtered if not p.get("_img_url"))
-    missing_price = sum(1 for p in filtered if p.get("regular_price") is None and p.get("sale_price") is None)
-    missing_url = sum(1 for p in filtered if not safe_text(p.get("url")).startswith("http"))
-    sale_count = sum(1 for p in filtered if p.get("on_sale"))
 
     st.markdown(
         f"""
         <div class="summary">
           <b>Catalog summary</b><br>
-          Products: <b>{len(filtered):,}</b> • On sale: <b>{sale_count:,}</b><br>
-          Missing image URLs: <b>{missing_img_url:,}</b> • Missing prices: <b>{missing_price:,}</b> • Missing clickable URLs: <b>{missing_url:,}</b>
+          Products: <b>{len(filtered):,}</b>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1277,9 +1137,7 @@ if st.session_state.step >= 3:
         st.rerun()
 
 
-# =========================
-# Step 4 — Generate + Preview + Download
-# =========================
+# Step 4
 if st.session_state.step >= 4:
     step_indicator(4)
     filtered = st.session_state.products_filtered
@@ -1297,30 +1155,17 @@ if st.session_state.step >= 4:
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### Preview & export")
-    st.markdown('<div class="muted">Downloads images (cached + retries), builds PDF, renders preview (optional), then download.</div>', unsafe_allow_html=True)
 
     progress = st.progress(0.0)
     stage = st.empty()
-    activity_box = st.empty()
-    activity = []
-    start_time = time.time()
 
-    def log(msg: str):
-        elapsed = time.time() - start_time
-        activity.append(f"[{elapsed:6.1f}s] {msg}")
-        activity_box.markdown(f"<div class='activity'>{html.escape(chr(10).join(activity[-22:]))}</div>", unsafe_allow_html=True)
-
-    stage.info("Stage 1/3 — Downloading images…")
-    log(f"Preset={preset} workers={dl_workers} retries={dl_retries} timeout={dl_timeout}s")
-
+    stage.info("Stage 1/2 — Downloading images…")
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
     done = 0
-    ok = 0
-    noimg = 0
 
     def task(p: dict):
-        b, _status = download_with_retries(p["_img_url"], timeout=dl_timeout, retries=dl_retries, backoff=dl_backoff)
+        b = download_with_retries(p["_img_url"], timeout=dl_timeout, retries=dl_retries, backoff=dl_backoff)
         return p, b
 
     with ThreadPoolExecutor(max_workers=dl_workers) as ex:
@@ -1329,18 +1174,11 @@ if st.session_state.step >= 4:
             p, b = fut.result()
             if b:
                 p["_image_pil"] = bytes_to_pil(b)
-                ok += 1
-            else:
-                p["_image_pil"] = None
-                noimg += 1
-
             done += 1
             progress.progress(min(0.70, (done / total) * 0.70))
-            if done % 50 == 0 or done == total:
-                log(f"Images: {done}/{total} (ok {ok}, missing {noimg})")
 
-    stage.info("Stage 2/3 — Building PDF…")
-    progress.progress(0.80)
+    stage.info("Stage 2/2 — Building PDF…")
+    progress.progress(0.85)
 
     pdf_bytes = make_catalog_pdf(
         filtered,
@@ -1355,40 +1193,10 @@ if st.session_state.step >= 4:
         currency_symbol=st.session_state.get("currency_symbol", "£"),
         brand_site=DEFAULT_SITE,
     )
+
     st.session_state.last_pdf = pdf_bytes
-    progress.progress(0.92)
-
-    stage.info("Stage 3/3 — Rendering preview…")
-    if HAS_PYMUPDF:
-        try:
-            imgs = pdf_preview_images(pdf_bytes, max_pages=int(st.session_state.get("preview_pages", 2)), zoom=1.35)
-            st.session_state.last_preview_imgs = imgs
-            stage.success("Ready.")
-        except Exception as e:
-            st.session_state.last_preview_imgs = []
-            stage.warning(f"Preview failed: {str(e)[:200]} (you can still download the PDF).")
-    else:
-        st.session_state.last_preview_imgs = []
-        stage.warning("Preview is disabled (PyMuPDF not installed). Add to requirements: pymupdf==1.23.26")
-
     progress.progress(1.0)
+    stage.success("Ready.")
+
+    st.download_button("Download PDF", data=pdf_bytes, file_name="bkosher_catalog.pdf", mime="application/pdf")
     st.markdown("</div>", unsafe_allow_html=True)
-
-    st.subheader("PDF preview")
-    if st.session_state.last_preview_imgs:
-        for i, img_bytes in enumerate(st.session_state.last_preview_imgs, start=1):
-            st.image(img_bytes, caption=f"Preview page {i}", use_container_width=True)
-    else:
-        st.info("Preview not available (but PDF is ready).")
-
-    st.download_button(
-        "Download PDF",
-        data=st.session_state.last_pdf,
-        file_name="bkosher_catalog.pdf",
-        mime="application/pdf",
-    )
-
-    st.caption(
-        "Clickability note: Some built-in PDF viewers ignore link annotations. "
-        "Best test: open in Chrome/Edge or Adobe Acrobat Reader."
-    )
