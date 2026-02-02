@@ -1,6 +1,8 @@
 # app.py
 # B-Kosher Customer Catalog Builder (WooCommerce)
 #
+# ✅ Streamlit Cloud friendly build (NO svglib / NO lxml)
+# ✅ Uses PNG logo (bkosher.png) for app + PDF header
 # ✅ Password login page first (password stored in Streamlit Secrets)
 # ✅ WooCommerce API credentials stored in Streamlit Secrets (no re-typing)
 # ✅ Data source: CSV upload OR WooCommerce API
@@ -21,25 +23,36 @@
 # ✅ Preview first N pages if PyMuPDF installed (optional)
 #
 # -------------------------------
-# LOCAL SECRETS SETUP (REQUIRED)
+# REQUIRED FILES IN REPO ROOT
 # -------------------------------
-# In the SAME folder as app.py create:
+# - app.py
+# - bkosher.png   (PNG version of your logo)
 #
-#   .streamlit/secrets.toml
+# -------------------------------
+# requirements.txt (Streamlit Cloud safe)
+# -------------------------------
+# streamlit==1.31.1
+# pandas==2.1.4
+# requests==2.31.0
+# Pillow==10.2.0
+# reportlab==3.6.13
+# urllib3==2.1.0
 #
-# Contents:
-#   WC_URL = "https://b-kosher.co.uk"  # Try without www if SSL errors
-#   WC_CK  = "ck_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-#   WC_CS  = "cs_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
-#   APP_PASSWORD = "Bkosher1234!"
-#
-# Install:
-#   python -m pip install streamlit pandas requests reportlab pillow svglib
 # Optional preview:
-#   python -m pip install pymupdf
+# pymupdf==1.23.26
 #
-# Run:
-#   python -m streamlit run app.py
+# runtime.txt (recommended):
+# python-3.11
+#
+# -------------------------------
+# LOCAL SECRETS SETUP
+# -------------------------------
+# .streamlit/secrets.toml (LOCAL ONLY; don't commit)
+#
+# WC_URL = "https://b-kosher.co.uk"
+# WC_CK  = "ck_..."
+# WC_CS  = "cs_..."
+# APP_PASSWORD = "Bkosher1234!"
 
 import io
 import re
@@ -65,9 +78,6 @@ from reportlab.lib.units import mm
 from reportlab.lib import colors
 from reportlab.lib.utils import ImageReader, simpleSplit
 
-from svglib.svglib import svg2rlg
-from reportlab.graphics import renderPDF
-
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -92,6 +102,8 @@ BRAND_BLUE = colors.HexColor(BRAND_BLUE_HEX)
 DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
+
+LOGO_PNG_PATH = "bkosher.png"  # <-- put this PNG in your repo root
 
 st.markdown(
     f"""
@@ -121,10 +133,6 @@ st.markdown(
         margin: 10px 0 14px 0;
         background: rgba(255,255,255,0.6);
       }}
-      .panel h3 {{
-        margin: 0 0 8px 0;
-        font-size: 1.05rem;
-      }}
       .muted {{
         color: #6b7280;
         font-size: 0.92rem;
@@ -143,10 +151,6 @@ st.markdown(
         font-weight: 700; font-size: 0.85rem;
         border: 1px solid rgba(0,0,0,0.10);
         background: white;
-      }}
-      .badge.red {{
-        color: {BRAND_RED_HEX};
-        border-color: rgba(200,16,46,0.25);
       }}
       .badge.blue {{
         color: {BRAND_BLUE_HEX};
@@ -226,7 +230,6 @@ login_gate()
 # URL sanitizer (NO KEY LEAKS)
 # =========================
 def sanitize_url(u: str) -> str:
-    """Remove consumer_key/consumer_secret from any URL before showing it."""
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
@@ -238,17 +241,18 @@ def sanitize_url(u: str) -> str:
 
 
 # =========================
-# UI helpers
+# App logo helpers (PNG)
 # =========================
-def render_logo_svg_in_app(svg_path: str, width: int = 200):
-    b = Path(svg_path).read_bytes()
-    b64 = base64.b64encode(b).decode("utf-8")
-    st.markdown(
-        f"""<div style="margin:0 0 10px 0;">
-            <img src="data:image/svg+xml;base64,{b64}" width="{width}" />
-        </div>""",
-        unsafe_allow_html=True,
-    )
+def render_logo_png_in_app(path: str, width: int = 200):
+    try:
+        st.image(path, width=width)
+    except Exception:
+        st.caption("Logo missing: add bkosher.png to the repo root.")
+
+
+@st.cache_resource(show_spinner=False)
+def load_logo_png_reader(path: str):
+    return ImageReader(path)
 
 
 # =========================
@@ -462,32 +466,6 @@ def api_cache_save(products_raw: list[dict]):
 
 
 # =========================
-# SVG logo for PDF
-# =========================
-@st.cache_resource(show_spinner=False)
-def load_svg_drawing(svg_path: str):
-    return svg2rlg(svg_path)
-
-
-def draw_svg_logo(c: canvas.Canvas, drawing, x: float, y: float, target_h: float) -> tuple[float, float]:
-    if drawing is None:
-        return (0.0, 0.0)
-    dw = float(getattr(drawing, "width", 0.0))
-    dh = float(getattr(drawing, "height", 0.0))
-    if dw <= 0 or dh <= 0:
-        return (0.0, 0.0)
-    scale = target_h / dh
-    placed_w = dw * scale
-    placed_h = dh * scale
-    c.saveState()
-    c.translate(x, y)
-    c.scale(scale, scale)
-    renderPDF.draw(drawing, c, 0, 0)
-    c.restoreState()
-    return (placed_w, placed_h)
-
-
-# =========================
 # WooCommerce API fetch (HARDENED)
 # =========================
 def wc_fetch_products(
@@ -495,7 +473,7 @@ def wc_fetch_products(
     ck: str,
     cs: str,
     *,
-    per_page: int = 25,          # safer than 50 for big catalogs
+    per_page: int = 25,
     timeout: int = 30,
     status: str = "publish",
     log_cb=None,
@@ -504,7 +482,7 @@ def wc_fetch_products(
     polite_delay_sec: float = 0.3,
 ):
     if not (base_url and ck and cs):
-        raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in secrets.toml.")
+        raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in secrets.toml (or Streamlit Cloud Secrets).")
 
     base_url = base_url.rstrip("/")
     endpoint = f"{base_url}/wp-json/wc/v3/products"
@@ -684,10 +662,8 @@ def make_catalog_pdf(
     show_desc: bool,
     show_attrs: bool,
     exclude_oos: bool,
-    new_page_per_category: bool,
     currency_symbol: str,
     brand_site: str,
-    logo_drawing=None,
 ):
     pagesize = A4 if pagesize_name == "A4" else letter
     page_w, page_h = pagesize
@@ -704,17 +680,30 @@ def make_catalog_pdf(
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = f"Prices correct as of {today_str}"
 
+    # Preload logo image for PDF
+    logo_reader = None
+    try:
+        logo_reader = load_logo_png_reader(LOGO_PNG_PATH)
+    except Exception:
+        logo_reader = None
+
     def draw_header(page_no: int):
         c.setStrokeColor(BRAND_BLUE)
         c.setLineWidth(1.1)
         c.line(margin, page_h - margin - header_h + 6, page_w - margin, page_h - margin - header_h + 6)
 
+        # Draw PNG logo left
         logo_h = 11 * mm
         logo_x = margin
         logo_y = page_h - margin - (logo_h + 3)
         logo_w = 0.0
-        if logo_drawing is not None:
-            logo_w, _ = draw_svg_logo(c, logo_drawing, logo_x, logo_y, logo_h)
+        if logo_reader is not None:
+            # Keep it conservative: wide-ish logo
+            logo_w = logo_h * 3.2
+            try:
+                c.drawImage(logo_reader, logo_x, logo_y, width=logo_w, height=logo_h, mask="auto")
+            except Exception:
+                logo_w = 0.0
 
         tx = margin + (logo_w + 10 if logo_w > 0 else 0)
         c.setFillColor(BRAND_BLUE)
@@ -874,10 +863,9 @@ def make_catalog_pdf(
                     line_y -= 10
                 c.setFillColor(colors.black)
 
+    # Group by category
     grouped = {}
     for p in products:
-        if exclude_oos and not is_in_stock(p):
-            continue
         grouped.setdefault(primary_category(p), []).append(p)
     categories = sorted(grouped.keys(), key=lambda s: s.lower())
 
@@ -888,6 +876,7 @@ def make_catalog_pdf(
     reserved_bottom = footer_h + 8
     usable_h_cards = page_h - margin - margin - reserved_top - reserved_bottom
 
+    # Force 3x3 on A4 when 3 columns
     if pagesize_name == "A4" and columns == 3:
         rows = 3
         card_h = (usable_h_cards - (rows - 1) * gutter) / rows
@@ -939,6 +928,7 @@ def make_catalog_pdf(
 
     c.showPage()
 
+    # Content
     page_no = 2
     for cat in categories:
         items = grouped[cat]
@@ -951,17 +941,17 @@ def make_catalog_pdf(
             draw_category_bar(cat)
 
             start_y = page_h - margin - reserved_top - card_h
-            y = start_y
+            yy = start_y
 
             for _r in range(rows):
-                x = margin
+                xx = margin
                 for _c in range(columns):
                     if idx >= len(items):
                         break
-                    draw_card(x, y, card_w, card_h, items[idx])
+                    draw_card(xx, yy, card_w, card_h, items[idx])
                     idx += 1
-                    x += card_w + gutter
-                y -= card_h + gutter
+                    xx += card_w + gutter
+                yy -= card_h + gutter
                 if idx >= len(items):
                     break
 
@@ -994,10 +984,7 @@ if "last_preview_imgs" not in st.session_state:
 # =========================
 with st.sidebar:
     st.markdown("### B-Kosher")
-    try:
-        render_logo_svg_in_app("bkosher.svg", width=190)
-    except Exception:
-        st.caption("Put bkosher.svg next to app.py.")
+    render_logo_png_in_app(LOGO_PNG_PATH, width=190)
 
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured (secrets)")
@@ -1058,7 +1045,7 @@ if st.button("Continue → Load products"):
 
 
 # =========================
-# Step 2 — Load products (CSV or API with caching)
+# Step 2 — Load products
 # =========================
 if st.session_state.step >= 2:
     step_indicator(2)
@@ -1067,20 +1054,12 @@ if st.session_state.step >= 2:
     st.markdown("### Load products")
     st.markdown('<div class="muted">API loads from disk cache instantly, unless you press refresh.</div>', unsafe_allow_html=True)
 
-    activity = []
-    activity_box = st.empty()
-
-    def log(msg: str):
-        activity.append(msg)
-        activity_box.markdown(f"<div class='activity'>{html.escape(chr(10).join(activity[-18:]))}</div>", unsafe_allow_html=True)
-
     if data_source == "CSV Upload":
         base_url = st.text_input("Base URL (used to build links if CSV has none)", value=DEFAULT_BASE_URL)
         csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"], key="csv_file")
         load_btn = st.button("Load products from CSV", disabled=(csv_file is None))
 
         if load_btn:
-            log("Reading CSV…")
             df = pd.read_csv(csv_file)
 
             col_id = pick_col(df, ["ID", "Id"])
@@ -1095,7 +1074,6 @@ if st.session_state.step >= 2:
             col_stock = pick_col(df, ["Stock status", "Stock Status", "stock_status"])
             col_slug = pick_col(df, ["Slug", "slug"])
 
-            log("Normalizing rows…")
             products = []
             for _, row in df.iterrows():
                 name = safe_text(row.get(col_name))
@@ -1163,7 +1141,6 @@ if st.session_state.step >= 2:
             st.rerun()
 
     else:
-        st.write("WooCommerce API uses secrets + caching (no keys shown).")
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
 
         c1, c2 = st.columns(2)
@@ -1185,7 +1162,6 @@ if st.session_state.step >= 2:
                 st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
                 st.rerun()
             except Exception as e:
-                # Important: our exceptions are sanitized; do not show raw request URL
                 st.error(str(e))
                 st.stop()
 
@@ -1206,18 +1182,12 @@ if st.session_state.step >= 3:
     g1, g2, g3 = st.columns([1.2, 1.0, 1.0])
     with g1:
         st.session_state.catalog_title = st.text_input("Catalog title", value=st.session_state.get("catalog_title", DEFAULT_TITLE))
-        st.session_state.logo_path = st.text_input("Logo path (SVG)", value=st.session_state.get("logo_path", "bkosher.svg"))
     with g2:
         st.session_state.pagesize_name = st.selectbox("Page size", ["A4", "Letter"], index=0 if st.session_state.get("pagesize_name", "A4") == "A4" else 1)
         st.session_state.columns = st.selectbox("Cards per row", [1, 2, 3], index={1:0,2:1,3:2}.get(int(st.session_state.get("columns", 3)), 2))
     with g3:
         st.session_state.currency_symbol = st.text_input("Currency symbol", value=st.session_state.get("currency_symbol", "£"))
         st.session_state.preview_pages = st.selectbox("Preview pages", [1, 2, 3], index={1:0,2:1,3:2}.get(int(st.session_state.get("preview_pages", 2)), 1))
-
-    try:
-        _ = load_svg_drawing(st.session_state.logo_path)
-    except Exception:
-        st.warning("Logo not loaded (PDF will still generate, but without logo).")
 
     all_cats = sorted({c for p in products for c in (p.get("categories") or []) if c}, key=lambda s: s.lower())
     st.session_state.selected_cats = st.multiselect("Categories (optional)", all_cats, default=st.session_state.get("selected_cats", []))
@@ -1234,8 +1204,6 @@ if st.session_state.step >= 3:
         st.session_state.show_attrs = st.checkbox("Attributes", value=st.session_state.get("show_attrs", True))
     with t5:
         st.session_state.exclude_oos = st.checkbox("Exclude out-of-stock", value=st.session_state.get("exclude_oos", True))
-
-    st.session_state.new_page_per_category = st.checkbox("New page per category", value=st.session_state.get("new_page_per_category", True))
 
     st.session_state.sort_mode = st.selectbox(
         "Sort",
@@ -1319,11 +1287,6 @@ if st.session_state.step >= 4:
         st.error("No products selected.")
         st.stop()
 
-    try:
-        logo_drawing = load_svg_drawing(st.session_state.get("logo_path", "bkosher.svg"))
-    except Exception:
-        logo_drawing = None
-
     preset = st.session_state.get("preset", "Reliable")
     if preset == "Reliable":
         dl_workers, dl_retries, dl_timeout, dl_backoff = 4, 8, 25, 0.8
@@ -1389,10 +1352,8 @@ if st.session_state.step >= 4:
         show_desc=bool(st.session_state.get("show_desc", True)),
         show_attrs=bool(st.session_state.get("show_attrs", True)),
         exclude_oos=bool(st.session_state.get("exclude_oos", True)),
-        new_page_per_category=bool(st.session_state.get("new_page_per_category", True)),
         currency_symbol=st.session_state.get("currency_symbol", "£"),
         brand_site=DEFAULT_SITE,
-        logo_drawing=logo_drawing,
     )
     st.session_state.last_pdf = pdf_bytes
     progress.progress(0.92)
@@ -1408,7 +1369,7 @@ if st.session_state.step >= 4:
             stage.warning(f"Preview failed: {str(e)[:200]} (you can still download the PDF).")
     else:
         st.session_state.last_preview_imgs = []
-        stage.warning("Preview is disabled (PyMuPDF not installed). Run: python -m pip install pymupdf")
+        stage.warning("Preview is disabled (PyMuPDF not installed). Add to requirements: pymupdf==1.23.26")
 
     progress.progress(1.0)
     st.markdown("</div>", unsafe_allow_html=True)
