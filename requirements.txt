@@ -3,8 +3,4 @@ pandas==2.1.4
 requests==2.31.0
 Pillow==10.2.0
 reportlab==3.6.13
-svglib==1.5.1
-lxml==4.9.4
-tinycss2==1.2.1
-cssselect2==0.7.0
 urllib3==2.1.0
