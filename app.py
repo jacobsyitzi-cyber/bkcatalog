@@ -1,4 +1,4 @@
-l# app.py
+# app.py
 # B-Kosher Customer Catalog Builder (Streamlit Cloud SAFE)
 #
 # ✅ FPDF2 (pure python) - deploys on Streamlit Cloud Python 3.13
