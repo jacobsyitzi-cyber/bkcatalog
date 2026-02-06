@@ -364,16 +364,6 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, ti
     endpoint = f"{base_url}/wp-json/wc/v3/products"
 
     session = requests.Session()
-    retry = Retry(
-        total=6,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
 
     page = 1
     out = []
@@ -431,6 +421,8 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, ti
                 "API fetch failed due to repeated SSL/connection errors while paging products. "
                 "Try again, or use the disk cache if already created.\n"
                 f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
+            )
+
             )
 
 
