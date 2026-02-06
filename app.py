@@ -54,63 +54,63 @@ DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 LOGO_PNG_PATH = "Bkosher.png"
 
 st.markdown(
-    f"""
+    """
     <style>
-      .stButton > button {{
-        background: {BRAND_RED_HEX} !important;
+      .stButton > button {
+        background: __RED__ !important;
         color: white !important;
-        border: 1px solid {BRAND_RED_HEX} !important;
+        border: 1px solid __RED__ !important;
         border-radius: 10px !important;
         font-weight: 800 !important;
-      }}
-      .stButton > button:hover {{
+      }
+      .stButton > button:hover {
         background: #a90d26 !important;
         border-color: #a90d26 !important;
-      }}
-      a {{ color: {BRAND_BLUE_HEX} !important; }}
-      section[data-testid="stSidebar"] {{
-        border-right: 3px solid {BRAND_BLUE_HEX};
-      }}
-      div[data-testid="stProgressBar"] > div > div {{
-        background-color: {BRAND_BLUE_HEX} !important;
-      }}
-      .panel {{
+      }
+      a { color: __BLUE__ !important; }
+      section[data-testid="stSidebar"] {
+        border-right: 3px solid __BLUE__;
+      }
+      div[data-testid="stProgressBar"] > div > div {
+        background-color: __BLUE__ !important;
+      }
+      .panel {
         border: 1px solid rgba(0,0,0,0.08);
         border-radius: 16px;
         padding: 14px 14px 6px 14px;
         margin: 10px 0 14px 0;
         background: rgba(255,255,255,0.6);
-      }}
-      .muted {{
+      }
+      .muted {
         color: #6b7280;
         font-size: 0.92rem;
         margin-top: -4px;
         margin-bottom: 10px;
-      }}
-      .step {{
+      }
+      .step {
         display:flex; gap:10px; align-items:center;
         padding: 10px 12px; border-radius: 14px;
         background: rgba(0, 76, 151, 0.06);
         border: 1px solid rgba(0, 76, 151, 0.15);
         margin: 8px 0 14px 0;
-      }}
-      .badge {{
+      }
+      .badge {
         display:inline-block; padding: 2px 8px; border-radius: 999px;
         font-weight: 700; font-size: 0.85rem;
         border: 1px solid rgba(0,0,0,0.10);
         background: white;
-      }}
-      .badge.blue {{
-        color: {BRAND_BLUE_HEX};
+      }
+      .badge.blue {
+        color: __BLUE__;
         border-color: rgba(0,76,151,0.25);
-      }}
-      .summary {{
+      }
+      .summary {
         border-radius: 16px;
         padding: 12px 14px;
         background: rgba(0,0,0,0.03);
         border: 1px solid rgba(0,0,0,0.08);
-      }}
-      .activity {{
+      }
+      .activity {
         border-radius: 14px;
         padding: 10px 12px;
         background: rgba(0,0,0,0.03);
@@ -120,12 +120,11 @@ st.markdown(
         white-space: pre-wrap;
         max-height: 320px;
         overflow: auto;
-      }}
+      }
     </style>
-    """,
+    """.replace("__RED__", BRAND_RED_HEX).replace("__BLUE__", BRAND_BLUE_HEX),
     unsafe_allow_html=True,
 )
-
 
 # =========================
 # SECRETS + LOGIN
