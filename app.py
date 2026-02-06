@@ -23,17 +23,6 @@
 # fpdf2==2.7.8
 #
 # NOTE: Delete packages.txt (not needed)
-#
-# ---------------------------
-# SECRETS
-# ---------------------------
-# Streamlit Cloud: App -> Settings -> Secrets
-# Local: .streamlit/secrets.toml (DON'T COMMIT)
-#
-# APP_PASSWORD = "Bkosher1234!"
-# WC_URL = "https://www.b-kosher.co.uk"
-# WC_CK  = "ck_..."
-# WC_CS  = "cs_..."
 
 import io
 import re
