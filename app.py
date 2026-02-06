@@ -617,7 +617,7 @@ def make_catalog_pdf_bytes(
     usable_w = pdf.w - 2 * margin
     card_w = (usable_w - (columns - 1) * gutter) / columns
 
-    rows = 3
+    rows = 3  # FIXED: 3 rows so 3x3 grid fits
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
@@ -632,9 +632,12 @@ def make_catalog_pdf_bytes(
 
     cats, grouped = grouped_products()
 
-    # Contents
+    blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
+    red_rgb = hex_to_rgb(BRAND_RED_HEX)
+
+    # ---------- Contents ----------
     pdf.add_page()
-    pdf.set_text_color(*hex_to_rgb(BRAND_BLUE_HEX))
+    pdf.set_text_color(*blue_rgb)
     pdf.set_font("Helvetica", "B", 20)
     pdf.set_xy(margin, 36)
     pdf.cell(0, 10, "Contents", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -668,10 +671,7 @@ def make_catalog_pdf_bytes(
         pdf.set_text_color(17, 24, 39)
         y += 8
 
-    # Pages
-    blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
-    red_rgb = hex_to_rgb(BRAND_RED_HEX)
-
+    # ---------- Category pages ----------
     for cat in cats:
         items = grouped.get(cat, [])
         if not items:
@@ -684,7 +684,7 @@ def make_catalog_pdf_bytes(
             # Category bar
             pdf.set_fill_color(*blue_rgb)
             bar_y = header_space
-            rect_any(pdf, margin, bar_y, pdf.w - 2 * margin, category_bar_h, style="F")
+            pdf.rect(margin, bar_y, pdf.w - 2 * margin, category_bar_h, style="F")
             pdf.set_text_color(255, 255, 255)
             pdf.set_font("Helvetica", "B", 11)
             pdf.set_xy(margin + 4, bar_y + 2.2)
@@ -695,29 +695,31 @@ def make_catalog_pdf_bytes(
             for r in range(rows):
                 yy = start_y + r * (card_h + gutter)
                 xx = margin
-                for _c in range(columns):
+
+                for c in range(columns):
                     if idx >= len(items):
                         break
+
                     p = items[idx]
                     idx += 1
 
-                    # Card
+                    # Card border
                     pdf.set_draw_color(*blue_rgb)
                     pdf.set_line_width(0.5)
-                    rect_any(pdf, xx, yy, card_w, card_h, style="D")
+                    pdf.rect(xx, yy, card_w, card_h, style="D")
 
-                    # Link
+                    # Clickable card
                     url = safe_text(p.get("url"))
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
 
+                    # Image box
                     pad = 3.5
                     img_h = card_h * 0.48
                     img_w = card_w - 2 * pad
                     img_x = xx + pad
                     img_y = yy + pad + 3
 
-                    # Image (no grey background)
                     if p.get("_image_path"):
                         try:
                             pdf.image(p["_image_path"], x=img_x, y=img_y, w=img_w, h=img_h)
@@ -730,18 +732,18 @@ def make_catalog_pdf_bytes(
                         pdf.cell(card_w, 4, "No image", align="C")
 
                     # Text region
-                    text_top = img_y + img_h + 2
                     tx = xx + pad
                     max_w = card_w - 2 * pad
+                    text_top = img_y + img_h + 2
+                    line_y = text_top
 
                     # Name
                     pdf.set_text_color(0, 0, 0)
                     pdf.set_font("Helvetica", "B", 9.5)
                     name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
-                    pdf.set_xy(tx, text_top)
+                    pdf.set_xy(tx, line_y)
                     pdf.cell(max_w, 4.5, name)
-
-                    line_y = text_top + 5.2
+                    line_y += 5.2
 
                     # Price
                     if show_price:
@@ -786,7 +788,7 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
-                    # Attributes (max 2)
+                    # Attributes (up to 2 lines)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
