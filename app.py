@@ -1,57 +1,75 @@
-# app.py (NO pandas)
-# Streamlit Cloud build-proof version
+# app.py
+# B-Kosher Customer Catalog Builder (Streamlit Cloud SAFE)
+#
+# ✅ Uses FPDF2 (pure Python) -> builds on Streamlit Cloud even on Python 3.13
+# ✅ PNG logo in app + PDF header
+# ✅ Password login gate (from Streamlit Secrets)
+# ✅ Data source: CSV upload OR WooCommerce API (from secrets)
+# ✅ API disk cache: ./api_cache/products.json
+# ✅ Image disk cache: ./image_cache/*.jpg (with retries/backoff, no "fails")
+# ✅ Filters: category + search; layout 3x3 grid on A4
+# ✅ No front cover (starts with Contents page)
+# ✅ Clickable product cards (links)
+# ✅ Sale badge + Save £X (Y%) + regular price strike-through
+# ✅ Optional attributes / SKU / description
+# ✅ Fixes: HTML entities (&amp; -> &), no "nan", price always 2dp
+#
+# ---------------------------
+# REQUIREMENTS.TXT (use this!)
+# ---------------------------
+# streamlit==1.31.1
+# requests==2.31.0
+# Pillow==10.4.0
+# fpdf2==2.7.8
+#
+# NOTE: Delete packages.txt (not needed)
+#
+# ---------------------------
+# SECRETS
+# ---------------------------
+# Streamlit Cloud: App -> Settings -> Secrets
+# Local: .streamlit/secrets.toml (DON'T COMMIT)
+#
+# APP_PASSWORD = "Bkosher1234!"
+# WC_URL = "https://www.b-kosher.co.uk"
+# WC_CK  = "ck_..."
+# WC_CS  = "cs_..."
 
 import io
 import re
+import csv
+import json
 import time
 import math
-import json
 import html
 import hashlib
 import datetime
-import csv
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import streamlit as st
 from PIL import Image
 
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4, letter
-from reportlab.lib.units import mm
-from reportlab.lib import colors
-from reportlab.lib.utils import ImageReader, simpleSplit
-
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Optional PDF preview (ONLY if you add pymupdf to requirements)
-try:
-    import fitz  # PyMuPDF
-    HAS_PYMUPDF = True
-except ModuleNotFoundError:
-    HAS_PYMUPDF = False
+from fpdf import FPDF
+from fpdf.enums import XPos, YPos
 
 
 # =========================
-# CONFIG
+# APP CONFIG + BRANDING
 # =========================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
 BRAND_RED_HEX = "#C8102E"
 BRAND_BLUE_HEX = "#004C97"
-BRAND_RED = colors.HexColor(BRAND_RED_HEX)
-BRAND_BLUE = colors.HexColor(BRAND_BLUE_HEX)
 
 DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-# Change this to your exact file name in GitHub repo:
-# LOGO_PNG_PATH = "bkosher.png"
-LOGO_PNG_PATH = "bkosher.png"
+# Your repo shows: Bkosher.png
+LOGO_PNG_PATH = "Bkosher.png"
 
 st.markdown(
     f"""
@@ -164,7 +182,6 @@ def login_gate():
             st.rerun()
         else:
             st.error("Incorrect password.")
-
     st.stop()
 
 
@@ -174,17 +191,6 @@ login_gate()
 # =========================
 # Helpers
 # =========================
-def sanitize_url(u: str) -> str:
-    try:
-        parts = urlsplit(u)
-        q = parse_qsl(parts.query, keep_blank_values=True)
-        q = [(k, v) for (k, v) in q if k not in ("consumer_key", "consumer_secret")]
-        clean_query = urlencode(q)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, clean_query, parts.fragment))
-    except Exception:
-        return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
-
-
 def safe_text(v) -> str:
     if v is None:
         return ""
@@ -229,24 +235,19 @@ def parse_money(v) -> float | None:
 def fmt_money(symbol: str, v: float | None) -> str:
     if v is None:
         return ""
-    return f"{symbol}{v:,.2f}"
+    return f"{symbol}{v:.2f}"
 
 
-def wrap_with_ellipsis(text: str, font_name: str, font_size: float, max_width: float, max_lines: int) -> list[str]:
-    text = safe_text(text)
-    if not text:
-        return []
-    lines = simpleSplit(text, font_name, font_size, max_width)
-    if len(lines) <= max_lines:
-        return lines
-    kept = lines[:max_lines]
-    last = kept[-1]
-    ell = "…"
-    from reportlab.pdfbase.pdfmetrics import stringWidth
-    while last and stringWidth(last + ell, font_name, font_size) > max_width:
-        last = last[:-1].rstrip()
-    kept[-1] = (last + ell) if last else ell
-    return kept
+def sanitize_url(u: str) -> str:
+    # remove consumer_key/consumer_secret from any displayed URL
+    try:
+        parts = urlsplit(u)
+        q = parse_qsl(parts.query, keep_blank_values=True)
+        q = [(k, v) for (k, v) in q if k not in ("consumer_key", "consumer_secret")]
+        clean_query = urlencode(q)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, clean_query, parts.fragment))
+    except Exception:
+        return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
 
 
 def primary_category(p: dict) -> str:
@@ -261,31 +262,11 @@ def is_in_stock(p: dict) -> bool:
     return s != "outofstock"
 
 
-def effective_price(p: dict) -> float | None:
-    reg = p.get("regular_price")
-    sale = p.get("sale_price")
-    if p.get("on_sale") and sale is not None:
-        return sale
-    return reg
-
-
-@st.cache_resource(show_spinner=False)
-def load_logo_png_reader(path: str):
-    return ImageReader(path)
-
-
-def render_logo_png_in_app(path: str, width: int = 200):
-    try:
-        st.image(path, width=width)
-    except Exception:
-        st.caption("Logo missing: add your PNG file to the repo root.")
-
-
 # =========================
-# Caches
+# Disk caches
 # =========================
-CACHE_DIR = Path("./image_cache")
-CACHE_DIR.mkdir(exist_ok=True)
+IMAGE_CACHE_DIR = Path("./image_cache")
+IMAGE_CACHE_DIR.mkdir(exist_ok=True)
 
 API_CACHE_DIR = Path("./api_cache")
 API_CACHE_DIR.mkdir(exist_ok=True)
@@ -294,7 +275,7 @@ API_CACHE_FILE = API_CACHE_DIR / "products.json"
 
 def cache_path_for_url(url: str) -> Path:
     h = hashlib.sha1(url.encode("utf-8")).hexdigest()
-    return CACHE_DIR / f"{h}.jpg"
+    return IMAGE_CACHE_DIR / f"{h}.jpg"
 
 
 def read_image_cache(url: str) -> bytes | None:
@@ -328,7 +309,7 @@ def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> by
         return None
 
 
-def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float) -> bytes | None:
+def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float, log_cb=None) -> bytes | None:
     if not url or not url.startswith("http"):
         return None
 
@@ -351,17 +332,11 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             final = cooked if cooked else raw
             write_image_cache(url, final)
             return final
-        except Exception:
+        except Exception as e:
+            if log_cb and attempt == retries:
+                log_cb(f"Image failed (giving up): {url[:80]}… ({type(e).__name__})")
             continue
-
     return None
-
-
-def bytes_to_pil(b: bytes) -> Image.Image | None:
-    try:
-        return Image.open(io.BytesIO(b)).convert("RGB")
-    except Exception:
-        return None
 
 
 def api_cache_load():
@@ -390,9 +365,9 @@ def api_cache_save(products_raw: list[dict]):
 
 
 # =========================
-# Woo API
+# Woo API fetch
 # =========================
-def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, timeout: int = 30):
+def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, timeout: int = 30, log_cb=None):
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
@@ -424,6 +399,9 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, ti
             "status": "publish",
         }
 
+        if log_cb:
+            log_cb(f"API: fetching page {page}…")
+
         last_exc = None
         for attempt in range(ssl_retries + 1):
             if attempt > 0:
@@ -451,7 +429,7 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, ti
 
                 page += 1
                 if page % 10 == 0:
-                    time.sleep(0.3)
+                    time.sleep(0.25)
                 last_exc = None
                 break
 
@@ -460,7 +438,11 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page: int = 25, ti
                 continue
 
         if last_exc is not None:
-            raise RuntimeError(f"API fetch failed (connection issues). Details: {type(last_exc).__name__}: {str(last_exc)[:200]}")
+            raise RuntimeError(
+                "API fetch failed due to repeated SSL/connection errors while paging products. "
+                "Try again, or use the disk cache if already created.\n"
+                f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
+            )
 
 
 def wc_to_product(p: dict) -> dict:
@@ -500,7 +482,7 @@ def wc_to_product(p: dict) -> dict:
         "url": safe_text(p.get("permalink")) or "",
         "stock_status": safe_text(p.get("stock_status")) or "",
         "_img_url": img_url,
-        "_image_pil": None,
+        "_image_path": None,  # local file path for fpdf image embedding
     }
 
 
@@ -520,345 +502,17 @@ def get_products_from_api_or_cache(wc_url: str, wc_ck: str, wc_cs: str, timeout:
 
 
 # =========================
-# PDF Preview (optional)
-# =========================
-def pdf_preview_images(pdf_bytes: bytes, max_pages: int = 2, zoom: float = 1.35) -> list[bytes]:
-    if not HAS_PYMUPDF:
-        return []
-    imgs = []
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    n = min(max_pages, doc.page_count)
-    mat = fitz.Matrix(zoom, zoom)
-    for i in range(n):
-        page = doc.load_page(i)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        imgs.append(pix.tobytes("png"))
-    doc.close()
-    return imgs
-
-
-# =========================
-# PDF builder (NO cover)
-# =========================
-def make_catalog_pdf(
-    products: list[dict],
-    *,
-    title: str,
-    pagesize_name: str,
-    columns: int,
-    show_price: bool,
-    show_sku: bool,
-    show_desc: bool,
-    show_attrs: bool,
-    exclude_oos: bool,
-    currency_symbol: str,
-    brand_site: str,
-):
-    pagesize = A4 if pagesize_name == "A4" else letter
-    page_w, page_h = pagesize
-
-    margin = 12 * mm
-    gutter = 6 * mm
-    header_h = 16 * mm
-    footer_h = 14 * mm
-    category_bar_h = 18
-
-    pdf = io.BytesIO()
-    c = canvas.Canvas(pdf, pagesize=pagesize)
-
-    today_str = datetime.date.today().strftime("%d %b %Y")
-    disclaimer = f"Prices correct as of {today_str}"
-
-    logo_reader = None
-    try:
-        logo_reader = load_logo_png_reader(LOGO_PNG_PATH)
-    except Exception:
-        logo_reader = None
-
-    def draw_header(page_no: int):
-        c.setStrokeColor(BRAND_BLUE)
-        c.setLineWidth(1.1)
-        c.line(margin, page_h - margin - header_h + 6, page_w - margin, page_h - margin - header_h + 6)
-
-        logo_h = 11 * mm
-        logo_x = margin
-        logo_y = page_h - margin - (logo_h + 3)
-        logo_w = 0.0
-        if logo_reader is not None:
-            logo_w = logo_h * 3.2
-            try:
-                c.drawImage(logo_reader, logo_x, logo_y, width=logo_w, height=logo_h, mask="auto")
-            except Exception:
-                logo_w = 0.0
-
-        tx = margin + (logo_w + 10 if logo_w > 0 else 0)
-        c.setFillColor(BRAND_BLUE)
-        c.setFont("Helvetica-Bold", 12.8)
-        c.drawString(tx, page_h - margin - 13, safe_text(title) or DEFAULT_TITLE)
-
-        c.setFillColor(colors.black)
-        c.setFont("Helvetica", 9)
-        c.drawRightString(page_w - margin, page_h - margin - 13, f"Page {page_no}")
-
-    def draw_footer():
-        c.setStrokeColor(BRAND_RED)
-        c.setLineWidth(0.9)
-        y_line = margin + footer_h - 8
-        c.line(margin, y_line, page_w - margin, y_line)
-        c.setFillColor(colors.HexColor("#374151"))
-        c.setFont("Helvetica", 8.5)
-        c.drawString(margin, margin + 2, f"{brand_site} • {disclaimer}")
-        c.setFillColor(colors.black)
-
-    def draw_category_bar(cat_name: str):
-        bar_y = page_h - margin - header_h - 8
-        c.setFillColor(BRAND_BLUE)
-        c.roundRect(margin, bar_y - category_bar_h, page_w - 2 * margin, category_bar_h, 6, fill=1, stroke=0)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 11)
-        c.drawString(margin + 10, bar_y - 13, cat_name)
-        c.setFillColor(colors.black)
-
-    def draw_sale_badge(x: float, y: float, w: float, h: float, p: dict):
-        reg = p.get("regular_price")
-        sale = p.get("sale_price")
-        if not p.get("on_sale") or sale is None or reg is None or sale >= reg:
-            return
-        save_amt = reg - sale
-        save_pct = (save_amt / reg) * 100 if reg else 0
-
-        badge_w = 28 * mm
-        badge_h = 10 * mm
-        bx = x + w - badge_w - 6
-        by = y + h - badge_h - 6
-
-        c.setFillColor(BRAND_RED)
-        c.roundRect(bx, by, badge_w, badge_h, 5, fill=1, stroke=0)
-        c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 9.5)
-        c.drawCentredString(bx + badge_w / 2, by + 2.6, "SALE")
-
-        c.setFillColor(colors.HexColor("#111827"))
-        c.setFont("Helvetica", 8.2)
-        c.drawRightString(x + w - 6, by - 4, f"Save {currency_symbol}{save_amt:.2f} ({save_pct:.0f}%)")
-        c.setFillColor(colors.black)
-
-    def draw_card(x: float, y: float, card_w: float, card_h: float, p: dict):
-        c.setLineWidth(1.0)
-        c.setStrokeColor(BRAND_BLUE)
-        c.roundRect(x, y, card_w, card_h, 8, stroke=1, fill=0)
-
-        url = safe_text(p.get("url"))
-        if url.startswith("http"):
-            inset = 0.5
-            c.linkURL(url, (x + inset, y + inset, x + card_w - inset, y + card_h - inset), relative=0, thickness=0)
-
-        draw_sale_badge(x, y, card_w, card_h, p)
-
-        pad = 7
-        img_box_h = card_h * 0.48
-        img_box_w = card_w - 2 * pad
-        img_x = x + pad
-        img_y = y + card_h - pad - img_box_h
-
-        img = p.get("_image_pil")
-        if img:
-            iw, ih = img.size
-            scale = min(img_box_w / iw, img_box_h / ih)
-            nw, nh = iw * scale, ih * scale
-            ox = img_x + (img_box_w - nw) / 2
-            oy = img_y + (img_box_h - nh) / 2
-            c.drawImage(ImageReader(img), ox, oy, nw, nh, preserveAspectRatio=True, anchor="c")
-
-        text_x = x + pad
-        text_w = card_w - 2 * pad
-        line_y = img_y - 8
-
-        c.setFont("Helvetica-Bold", 10.0)
-        for ln in wrap_with_ellipsis(p.get("name", ""), "Helvetica-Bold", 10.0, text_w, 2):
-            c.drawString(text_x, line_y, ln)
-            line_y -= 12
-
-        if show_price:
-            reg = p.get("regular_price")
-            sale = p.get("sale_price")
-            on_sale = bool(p.get("on_sale")) and sale is not None and reg is not None and sale < reg
-
-            if on_sale:
-                c.setFillColor(BRAND_RED)
-                c.setFont("Helvetica-Bold", 10.6)
-                c.drawString(text_x, line_y, fmt_money(currency_symbol, sale))
-
-                c.setFillColor(colors.HexColor("#6b7280"))
-                reg_txt = fmt_money(currency_symbol, reg)
-                c.setFont("Helvetica", 8.6)
-                rx = text_x + 58
-                c.drawString(rx, line_y + 1, reg_txt)
-                c.setLineWidth(1)
-                c.setStrokeColor(colors.HexColor("#6b7280"))
-                c.line(rx, line_y + 4.5, rx + c.stringWidth(reg_txt, "Helvetica", 8.6), line_y + 4.5)
-
-                c.setStrokeColor(BRAND_BLUE)
-                c.setFillColor(colors.black)
-                line_y -= 14
-            else:
-                if reg is not None:
-                    c.setFillColor(BRAND_RED)
-                    c.setFont("Helvetica-Bold", 10.6)
-                    c.drawString(text_x, line_y, fmt_money(currency_symbol, reg))
-                    c.setFillColor(colors.black)
-                    line_y -= 14
-
-        if show_sku:
-            sku = safe_text(p.get("sku"))
-            if sku:
-                c.setFont("Helvetica", 8.8)
-                c.setFillColor(colors.HexColor("#222222"))
-                c.drawString(text_x, line_y, f"SKU: {sku}")
-                line_y -= 12
-                c.setFillColor(colors.black)
-
-        if show_attrs:
-            attrs = p.get("attributes") or []
-            if attrs:
-                c.setFont("Helvetica", 8.2)
-                c.setFillColor(colors.HexColor("#374151"))
-                shown = 0
-                for (an, av) in attrs:
-                    if shown >= 2:
-                        break
-                    an = safe_text(an)
-                    av = safe_text(av)
-                    if not an or not av:
-                        continue
-                    one = wrap_with_ellipsis(f"{an}: {av}", "Helvetica", 8.2, text_w, 1)
-                    if one:
-                        c.drawString(text_x, line_y, one[0])
-                        line_y -= 10
-                        shown += 1
-                c.setFillColor(colors.black)
-
-        if show_desc:
-            desc = strip_html(p.get("short_desc", ""))
-            if desc:
-                c.setFont("Helvetica", 8.2)
-                c.setFillColor(colors.HexColor("#555555"))
-                for ln in wrap_with_ellipsis(desc, "Helvetica", 8.2, text_w, 2):
-                    c.drawString(text_x, line_y, ln)
-                    line_y -= 10
-                c.setFillColor(colors.black)
-
-    grouped = {}
-    for p in products:
-        if exclude_oos and not is_in_stock(p):
-            continue
-        grouped.setdefault(primary_category(p), []).append(p)
-    categories = sorted(grouped.keys(), key=lambda s: s.lower())
-
-    usable_w = page_w - 2 * margin
-    card_w = (usable_w - (columns - 1) * gutter) / columns
-
-    reserved_top = header_h + category_bar_h + 18
-    reserved_bottom = footer_h + 8
-    usable_h_cards = page_h - margin - margin - reserved_top - reserved_bottom
-
-    if pagesize_name == "A4" and columns == 3:
-        rows = 3
-        card_h = (usable_h_cards - (rows - 1) * gutter) / rows
-    else:
-        rows = max(1, int(usable_h_cards // (78 * mm + gutter)))
-        card_h = (usable_h_cards - (rows - 1) * gutter) / rows
-
-    # Contents page
-    page_no = 2
-    cat_first_page = {}
-    per_page = rows * columns
-    for cat in categories:
-        items = grouped[cat]
-        if not items:
-            continue
-        cat_first_page[cat] = page_no
-        page_no += math.ceil(len(items) / per_page)
-
-    c.setFillColor(BRAND_BLUE)
-    c.setFont("Helvetica-Bold", 20)
-    c.drawString(margin, page_h - margin - 50, "Contents")
-
-    c.setFillColor(colors.HexColor("#374151"))
-    c.setFont("Helvetica", 10)
-    c.drawString(margin, page_h - margin - 70, disclaimer)
-
-    y = page_h - margin - 105
-    c.setFont("Helvetica", 11)
-    c.setFillColor(colors.HexColor("#111827"))
-    for cat in categories:
-        if y < margin + 80:
-            c.showPage()
-            c.setFillColor(BRAND_BLUE)
-            c.setFont("Helvetica-Bold", 20)
-            c.drawString(margin, page_h - margin - 50, "Contents (cont.)")
-            y = page_h - margin - 90
-            c.setFont("Helvetica", 11)
-            c.setFillColor(colors.HexColor("#111827"))
-
-        pg = cat_first_page.get(cat, "")
-        c.drawString(margin, y, cat)
-        c.setFillColor(colors.HexColor("#6b7280"))
-        c.drawRightString(page_w - margin, y, str(pg))
-        c.setFillColor(colors.HexColor("#111827"))
-        y -= 18
-
-    c.showPage()
-
-    # Content pages
-    page_no = 2
-    for cat in categories:
-        items = grouped[cat]
-        if not items:
-            continue
-
-        idx = 0
-        while idx < len(items):
-            draw_header(page_no)
-            draw_category_bar(cat)
-
-            start_y = page_h - margin - reserved_top - card_h
-            yy = start_y
-            for _r in range(rows):
-                xx = margin
-                for _c in range(columns):
-                    if idx >= len(items):
-                        break
-                    draw_card(xx, yy, card_w, card_h, items[idx])
-                    idx += 1
-                    xx += card_w + gutter
-                yy -= card_h + gutter
-                if idx >= len(items):
-                    break
-
-            draw_footer()
-            c.showPage()
-            page_no += 1
-
-    c.save()
-    pdf.seek(0)
-    return pdf.read()
-
-
-# =========================
 # CSV loader (no pandas)
 # =========================
 def read_csv_bytes(uploaded_file) -> list[dict]:
     content = uploaded_file.getvalue()
-    # try utf-8, fallback to latin-1
     try:
         text = content.decode("utf-8")
     except Exception:
         text = content.decode("latin-1", errors="replace")
 
     reader = csv.DictReader(io.StringIO(text))
-    rows = list(reader)
-    return rows
+    return list(reader)
 
 
 def best_key(keys: list[str], candidates: list[str]) -> str | None:
@@ -870,7 +524,383 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
 
 
 # =========================
-# Session state
+# PDF building (FPDF2)
+# =========================
+def hex_to_rgb(h: str):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+class CatalogPDF(FPDF):
+    def __init__(self, title: str, logo_path: str, brand_site: str, disclaimer: str, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.catalog_title = title
+        self.logo_path = logo_path
+        self.brand_site = brand_site
+        self.disclaimer = disclaimer
+        self.blue = hex_to_rgb(BRAND_BLUE_HEX)
+        self.red = hex_to_rgb(BRAND_RED_HEX)
+        self.set_auto_page_break(auto=False)
+
+    def header(self):
+        # Logo
+        left = 12
+        top = 10
+        try:
+            self.image(self.logo_path, x=left, y=top, h=11)
+            title_x = left + 38
+        except Exception:
+            title_x = left
+
+        self.set_text_color(*self.blue)
+        self.set_font("Helvetica", "B", 13)
+        self.set_xy(title_x, top + 1)
+        self.cell(0, 8, self.catalog_title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        # Page number (top-right)
+        self.set_text_color(0, 0, 0)
+        self.set_font("Helvetica", "", 9)
+        self.set_xy(-12 - 25, top + 2)
+        self.cell(25, 8, f"Page {self.page_no()}", align="R")
+
+        # Blue rule under header
+        self.set_draw_color(*self.blue)
+        self.set_line_width(0.6)
+        self.line(12, 26, self.w - 12, 26)
+
+    def footer(self):
+        # Footer line + site/disclaimer
+        y = self.h - 14
+        self.set_draw_color(*self.red)
+        self.set_line_width(0.5)
+        self.line(12, y, self.w - 12, y)
+
+        self.set_text_color(55, 65, 81)
+        self.set_font("Helvetica", "", 8)
+        self.set_xy(12, y + 2)
+        self.cell(0, 8, f"{self.brand_site} • {self.disclaimer}")
+
+
+def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
+    # simple char-based truncation with ellipsis
+    if pdf.get_string_width(text) <= max_w:
+        return text
+    ell = "…"
+    t = text
+    while t and pdf.get_string_width(t + ell) > max_w:
+        t = t[:-1]
+    return (t + ell) if t else ell
+
+
+def draw_sale_badge(pdf: FPDF, x: float, y: float, w: float, p: dict, currency: str):
+    reg = p.get("regular_price")
+    sale = p.get("sale_price")
+    if not p.get("on_sale") or sale is None or reg is None or sale >= reg:
+        return
+
+    badge_w = 26
+    badge_h = 9
+    bx = x + w - badge_w - 3
+    by = y + 3
+
+    pdf.set_fill_color(*hex_to_rgb(BRAND_RED_HEX))
+    pdf.set_text_color(255, 255, 255)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.rounded_rect(bx, by, badge_w, badge_h, 2, style="F")
+    pdf.set_xy(bx, by + 1.7)
+    pdf.cell(badge_w, 6, "SALE", align="C")
+
+    save_amt = reg - sale
+    save_pct = (save_amt / reg) * 100 if reg else 0
+    pdf.set_text_color(17, 24, 39)
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_xy(x, by + badge_h + 1)
+    msg = f"Save {currency}{save_amt:.2f} ({save_pct:.0f}%)"
+    pdf.cell(w - 2, 4, msg, align="R")
+
+
+def make_catalog_pdf_bytes(
+    products: list[dict],
+    *,
+    title: str,
+    page_size: str,
+    columns: int,
+    currency_symbol: str,
+    show_price: bool,
+    show_sku: bool,
+    show_desc: bool,
+    show_attrs: bool,
+    exclude_oos: bool,
+):
+    today_str = datetime.date.today().strftime("%d %b %Y")
+    disclaimer = f"Prices correct as of {today_str}"
+
+    fmt = "A4" if page_size == "A4" else "Letter"
+    pdf = CatalogPDF(
+        title=title or DEFAULT_TITLE,
+        logo_path=LOGO_PNG_PATH,
+        brand_site=DEFAULT_SITE,
+        disclaimer=disclaimer,
+        orientation="P",
+        unit="mm",
+        format=fmt,
+    )
+
+    # Layout
+    margin = 12
+    gutter = 6
+    header_space = 28  # includes header line
+    footer_space = 18
+    category_bar_h = 10
+
+    usable_w = pdf.w - 2 * margin
+    card_w = (usable_w - (columns - 1) * gutter) / columns
+
+    # 3x3 requirement for A4 when columns=3
+    if fmt == "A4" and columns == 3:
+        rows = 3
+    else:
+        rows = 3  # keep consistent customer-friendly layout
+    usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
+    card_h = (usable_h - (rows - 1) * gutter) / rows
+
+    def grouped_products():
+        grouped = {}
+        for p in products:
+            if exclude_oos and not is_in_stock(p):
+                continue
+            grouped.setdefault(primary_category(p), []).append(p)
+        cats = sorted(grouped.keys(), key=lambda s: s.lower())
+        return cats, grouped
+
+    cats, grouped = grouped_products()
+
+    # Build contents page (page 1)
+    pdf.add_page()
+    pdf.set_text_color(*hex_to_rgb(BRAND_BLUE_HEX))
+    pdf.set_font("Helvetica", "B", 20)
+    pdf.set_xy(margin, 36)
+    pdf.cell(0, 10, "Contents", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.set_text_color(55, 65, 81)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_x(margin)
+    pdf.cell(0, 7, disclaimer, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # Precompute page numbers
+    per_page = rows * columns
+    page_no = 2
+    cat_first = {}
+    for cat in cats:
+        n = len(grouped.get(cat, []))
+        if n == 0:
+            continue
+        cat_first[cat] = page_no
+        page_no += math.ceil(n / per_page)
+
+    pdf.set_text_color(17, 24, 39)
+    pdf.set_font("Helvetica", "", 11)
+    y = 60
+    for cat in cats:
+        if y > pdf.h - 30:
+            pdf.add_page()
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.set_text_color(*hex_to_rgb(BRAND_BLUE_HEX))
+            pdf.set_xy(margin, 36)
+            pdf.cell(0, 10, "Contents (cont.)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.set_font("Helvetica", "", 11)
+            pdf.set_text_color(17, 24, 39)
+            y = 55
+
+        pdf.set_xy(margin, y)
+        pdf.cell(0, 7, cat)
+        pdf.set_xy(pdf.w - margin - 25, y)
+        pdf.set_text_color(107, 114, 128)
+        pdf.cell(25, 7, str(cat_first.get(cat, "")), align="R")
+        pdf.set_text_color(17, 24, 39)
+        y += 8
+
+    # Content pages
+    blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
+    red_rgb = hex_to_rgb(BRAND_RED_HEX)
+
+    for cat in cats:
+        items = grouped.get(cat, [])
+        if not items:
+            continue
+
+        idx = 0
+        while idx < len(items):
+            pdf.add_page()
+
+            # Category bar
+            pdf.set_fill_color(*blue_rgb)
+            bar_y = header_space
+            pdf.rounded_rect(margin, bar_y, pdf.w - 2 * margin, category_bar_h, 3, style="F")
+            pdf.set_text_color(255, 255, 255)
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_xy(margin + 4, bar_y + 2.2)
+            pdf.cell(0, 6, cat)
+
+            # Cards grid
+            start_y = header_space + category_bar_h + 6
+            for r in range(rows):
+                y = start_y + r * (card_h + gutter)
+                x = margin
+                for c in range(columns):
+                    if idx >= len(items):
+                        break
+                    p = items[idx]
+                    idx += 1
+
+                    # Card border
+                    pdf.set_draw_color(*blue_rgb)
+                    pdf.set_line_width(0.5)
+                    pdf.rounded_rect(x, y, card_w, card_h, 3, style="D")
+
+                    # Clickable link over the card
+                    url = safe_text(p.get("url"))
+                    if url.startswith("http"):
+                        # link area
+                        pdf.link(x=x, y=y, w=card_w, h=card_h, link=url)
+
+                    # Sale badge
+                    draw_sale_badge(pdf, x, y, card_w, p, currency_symbol)
+
+                    pad = 3.5
+                    img_h = card_h * 0.48
+                    img_w = card_w - 2 * pad
+                    img_x = x + pad
+                    img_y = y + pad + 3
+
+                    # Image (no grey background)
+                    if p.get("_image_path"):
+                        try:
+                            # Fit image to box by using width, keeping aspect
+                            pdf.image(p["_image_path"], x=img_x, y=img_y, w=img_w, h=img_h)
+                        except Exception:
+                            pass
+                    else:
+                        # tiny "No image"
+                        pdf.set_text_color(120, 120, 120)
+                        pdf.set_font("Helvetica", "I", 8)
+                        pdf.set_xy(x, img_y + img_h / 2 - 2)
+                        pdf.cell(card_w, 4, "No image", align="C")
+
+                    # Text area under image
+                    text_top = img_y + img_h + 2
+                    tx = x + pad
+                    max_w = card_w - 2 * pad
+
+                    pdf.set_text_color(0, 0, 0)
+                    pdf.set_font("Helvetica", "B", 9.5)
+                    name = safe_text(p.get("name"))
+                    name = name.replace("\n", " ")
+                    name = truncate_to_fit(pdf, name, max_w)
+                    pdf.set_xy(tx, text_top)
+                    pdf.cell(max_w, 4.5, name)
+
+                    line_y = text_top + 5.2
+
+                    if show_price:
+                        reg = p.get("regular_price")
+                        sale = p.get("sale_price")
+                        on_sale = bool(p.get("on_sale")) and sale is not None and reg is not None and sale < reg
+
+                        if on_sale:
+                            pdf.set_text_color(*red_rgb)
+                            pdf.set_font("Helvetica", "B", 10)
+                            pdf.set_xy(tx, line_y)
+                            pdf.cell(0, 5, fmt_money(currency_symbol, sale))
+
+                            # regular price with strike-through
+                            pdf.set_text_color(107, 114, 128)
+                            pdf.set_font("Helvetica", "", 8.5)
+                            reg_txt = fmt_money(currency_symbol, reg)
+                            rx = tx + 18
+                            pdf.set_xy(rx, line_y + 0.6)
+                            pdf.cell(0, 4, reg_txt)
+                            # strike line
+                            wtxt = pdf.get_string_width(reg_txt)
+                            pdf.set_draw_color(107, 114, 128)
+                            pdf.set_line_width(0.3)
+                            pdf.line(rx, line_y + 2.5, rx + wtxt, line_y + 2.5)
+
+                            line_y += 6
+                        else:
+                            if reg is not None:
+                                pdf.set_text_color(*red_rgb)
+                                pdf.set_font("Helvetica", "B", 10)
+                                pdf.set_xy(tx, line_y)
+                                pdf.cell(0, 5, fmt_money(currency_symbol, reg))
+                                line_y += 6
+
+                        pdf.set_text_color(0, 0, 0)
+
+                    if show_sku:
+                        sku = safe_text(p.get("sku"))
+                        if sku:
+                            pdf.set_text_color(31, 41, 55)
+                            pdf.set_font("Helvetica", "", 8.5)
+                            pdf.set_xy(tx, line_y)
+                            pdf.cell(0, 4, f"SKU: {sku}")
+                            line_y += 4.5
+
+                    if show_attrs:
+                        attrs = p.get("attributes") or []
+                        if attrs:
+                            pdf.set_text_color(55, 65, 81)
+                            pdf.set_font("Helvetica", "", 7.8)
+                            shown = 0
+                            for (an, av) in attrs:
+                                if shown >= 2:
+                                    break
+                                an = safe_text(an)
+                                av = safe_text(av)
+                                if not an or not av:
+                                    continue
+                                line = f"{an}: {av}"
+                                line = truncate_to_fit(pdf, line, max_w)
+                                pdf.set_xy(tx, line_y)
+                                pdf.cell(0, 4, line)
+                                line_y += 4.0
+                                shown += 1
+
+                    if show_desc:
+                        desc = strip_html(p.get("short_desc"))
+                        if desc:
+                            pdf.set_text_color(75, 85, 99)
+                            pdf.set_font("Helvetica", "", 7.6)
+                            # 2 lines max
+                            for _ in range(2):
+                                if not desc:
+                                    break
+                                # naive line split by max width
+                                # keep chopping words
+                                words = desc.split(" ")
+                                line = ""
+                                while words and pdf.get_string_width((line + " " + words[0]).strip()) <= max_w:
+                                    line = (line + " " + words.pop(0)).strip()
+                                if not line:
+                                    line = truncate_to_fit(pdf, desc, max_w)
+                                    desc = ""
+                                else:
+                                    desc = " ".join(words).strip()
+                                pdf.set_xy(tx, line_y)
+                                pdf.cell(0, 4, line)
+                                line_y += 4.0
+
+                    x += card_w + gutter
+
+    out = pdf.output(dest="S")
+    # fpdf2 returns a "str" with latin-1 compatible bytes by default; encode to bytes
+    if isinstance(out, str):
+        out = out.encode("latin1", "ignore")
+    return out
+
+
+# =========================
+# UI state
 # =========================
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -880,8 +910,6 @@ if "products_filtered" not in st.session_state:
     st.session_state.products_filtered = []
 if "last_pdf" not in st.session_state:
     st.session_state.last_pdf = None
-if "last_preview_imgs" not in st.session_state:
-    st.session_state.last_preview_imgs = []
 
 
 # =========================
@@ -889,12 +917,19 @@ if "last_preview_imgs" not in st.session_state:
 # =========================
 with st.sidebar:
     st.markdown("### B-Kosher")
-    render_logo_png_in_app(LOGO_PNG_PATH, width=190)
+    try:
+        st.image(LOGO_PNG_PATH, width=190)
+    except Exception:
+        st.caption("Logo missing: upload Bkosher.png to repo root")
 
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured (secrets)")
     else:
         st.warning("Woo API secrets missing (API mode won't work)")
+
+    cached_raw, cached_at = api_cache_load()
+    if cached_raw is not None:
+        st.info(f"API cache: {len(cached_raw):,} items\n\nLast fetch: {cached_at}")
 
     st.markdown("---")
     if st.button("Logout"):
@@ -916,7 +951,7 @@ def step_indicator(step: int):
         1: "Step 1 — Choose data source",
         2: "Step 2 — Load products",
         3: "Step 3 — Filter & layout",
-        4: "Step 4 — Preview & export",
+        4: "Step 4 — Generate & download",
     }
     st.markdown(
         f"""
@@ -929,7 +964,9 @@ def step_indicator(step: int):
     )
 
 
-# Step 1
+# =========================
+# Step 1 — Choose source
+# =========================
 step_indicator(st.session_state.step)
 
 st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -943,12 +980,15 @@ if st.button("Continue → Load products"):
     st.rerun()
 
 
-# Step 2
+# =========================
+# Step 2 — Load products
+# =========================
 if st.session_state.step >= 2:
     step_indicator(2)
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### Load products")
+    st.markdown('<div class="muted">API mode uses a disk cache for speed. CSV mode loads instantly.</div>', unsafe_allow_html=True)
 
     if data_source == "CSV Upload":
         base_url = st.text_input("Base URL (used to build links if CSV has none)", value=DEFAULT_BASE_URL)
@@ -1009,7 +1049,6 @@ if st.session_state.step >= 2:
                         if slug:
                             url = f"{base_url.rstrip('/')}/{slug.lstrip('/')}"
 
-                # Attributes if present in Woo export
                 attrs = []
                 for i in range(1, 21):
                     ncol = f"Attribute {i} name"
@@ -1033,7 +1072,7 @@ if st.session_state.step >= 2:
                     "url": url,
                     "stock_status": stock_status,
                     "_img_url": img_url,
-                    "_image_pil": None,
+                    "_image_path": None,
                 })
 
             st.session_state.products_raw = products
@@ -1043,7 +1082,6 @@ if st.session_state.step >= 2:
 
     else:
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
-
         c1, c2 = st.columns(2)
         with c1:
             load_cached_btn = st.button("Load products (use cache if available)")
@@ -1052,6 +1090,13 @@ if st.session_state.step >= 2:
 
         if load_cached_btn or refresh_btn:
             try:
+                log_box = st.empty()
+                logs = []
+
+                def log(msg):
+                    logs.append(msg)
+                    log_box.markdown(f"<div class='activity'>{html.escape(chr(10).join(logs[-18:]))}</div>", unsafe_allow_html=True)
+
                 with st.spinner("Loading products…"):
                     products, fetched_at, source = get_products_from_api_or_cache(
                         WC_URL, WC_CK, WC_CS, timeout=api_timeout, force_refresh=bool(refresh_btn)
@@ -1067,23 +1112,26 @@ if st.session_state.step >= 2:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# Step 3
+# =========================
+# Step 3 — Filter & layout
+# =========================
 if st.session_state.step >= 3:
     step_indicator(3)
     products = st.session_state.products_raw
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("### Filter & layout")
+    st.markdown('<div class="muted">Choose what appears in the catalog and how it looks.</div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns([1.2, 1, 1])
     with c1:
         st.session_state.catalog_title = st.text_input("Catalog title", value=st.session_state.get("catalog_title", DEFAULT_TITLE))
     with c2:
-        st.session_state.pagesize_name = st.selectbox("Page size", ["A4", "Letter"], index=0)
+        st.session_state.page_size = st.selectbox("Page size", ["A4", "Letter"], index=0)
         st.session_state.columns = st.selectbox("Cards per row", [1, 2, 3], index=2)
     with c3:
         st.session_state.currency_symbol = st.text_input("Currency symbol", value=st.session_state.get("currency_symbol", "£"))
-        st.session_state.preview_pages = st.selectbox("Preview pages", [1, 2, 3], index=1)
+        st.session_state.preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
 
     all_cats = sorted({c for p in products for c in (p.get("categories") or []) if c}, key=lambda s: s.lower())
     st.session_state.selected_cats = st.multiselect("Categories (optional)", all_cats, default=st.session_state.get("selected_cats", []))
@@ -1101,8 +1149,7 @@ if st.session_state.step >= 3:
     with t5:
         st.session_state.exclude_oos = st.checkbox("Exclude out-of-stock", value=st.session_state.get("exclude_oos", True))
 
-    st.session_state.preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
-
+    # Filter
     filtered = products[:]
     if st.session_state.selected_cats:
         sset = set(st.session_state.selected_cats)
@@ -1118,11 +1165,16 @@ if st.session_state.step >= 3:
     filtered.sort(key=lambda p: (primary_category(p).lower(), safe_text(p.get("name")).lower()))
     st.session_state.products_filtered = filtered
 
+    sale_count = sum(1 for p in filtered if p.get("on_sale"))
+    missing_img = sum(1 for p in filtered if not p.get("_img_url"))
+    missing_url = sum(1 for p in filtered if not safe_text(p.get("url")).startswith("http"))
+
     st.markdown(
         f"""
         <div class="summary">
           <b>Catalog summary</b><br>
-          Products: <b>{len(filtered):,}</b>
+          Products: <b>{len(filtered):,}</b> • On sale: <b>{sale_count:,}</b><br>
+          Missing image URLs: <b>{missing_img:,}</b> • Missing clickable URLs: <b>{missing_url:,}</b>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1130,14 +1182,14 @@ if st.session_state.step >= 3:
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    if st.button("Generate PDF + Preview", disabled=(len(filtered) == 0)):
+    if st.button("Continue → Generate PDF", disabled=(len(filtered) == 0)):
         st.session_state.step = 4
-        st.session_state.last_pdf = None
-        st.session_state.last_preview_imgs = []
         st.rerun()
 
 
-# Step 4
+# =========================
+# Step 4 — Download images + build PDF
+# =========================
 if st.session_state.step >= 4:
     step_indicator(4)
     filtered = st.session_state.products_filtered
@@ -1147,56 +1199,75 @@ if st.session_state.step >= 4:
 
     preset = st.session_state.get("preset", "Reliable")
     if preset == "Reliable":
-        dl_workers, dl_retries, dl_timeout, dl_backoff = 4, 8, 25, 0.8
+        dl_workers, dl_retries, dl_timeout, dl_backoff = 4, 10, 25, 0.9
     elif preset == "Normal":
-        dl_workers, dl_retries, dl_timeout, dl_backoff = 6, 5, 18, 0.6
+        dl_workers, dl_retries, dl_timeout, dl_backoff = 6, 6, 18, 0.7
     else:
         dl_workers, dl_retries, dl_timeout, dl_backoff = 10, 3, 12, 0.5
 
     st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("### Preview & export")
+    st.markdown("### Generate & download")
+    st.markdown('<div class="muted">Downloading images (cached + retries), then building the PDF.</div>', unsafe_allow_html=True)
 
     progress = st.progress(0.0)
-    stage = st.empty()
+    status = st.empty()
+    activity_box = st.empty()
+    activity = []
+    t0 = time.time()
 
-    stage.info("Stage 1/2 — Downloading images…")
+    def log(msg: str):
+        activity.append(f"[{time.time()-t0:6.1f}s] {msg}")
+        activity_box.markdown(f"<div class='activity'>{html.escape(chr(10).join(activity[-22:]))}</div>", unsafe_allow_html=True)
+
+    # Download images -> save local file paths for fpdf2
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
     done = 0
+    ok = 0
 
-    def task(p: dict):
-        b = download_with_retries(p["_img_url"], timeout=dl_timeout, retries=dl_retries, backoff=dl_backoff)
+    status.info("Stage 1/2 — Downloading images…")
+    log(f"Preset={preset} workers={dl_workers} retries={dl_retries}")
+
+    def dl_task(p: dict):
+        b = download_with_retries(p["_img_url"], timeout=dl_timeout, retries=dl_retries, backoff=dl_backoff, log_cb=log)
         return p, b
 
     with ThreadPoolExecutor(max_workers=dl_workers) as ex:
-        futures = [ex.submit(task, p) for p in items]
+        futures = [ex.submit(dl_task, p) for p in items]
         for fut in as_completed(futures):
             p, b = fut.result()
             if b:
-                p["_image_pil"] = bytes_to_pil(b)
+                # ensure cached file exists; store path
+                p["_image_path"] = str(cache_path_for_url(p["_img_url"]))
+                ok += 1
+            else:
+                p["_image_path"] = None
             done += 1
-            progress.progress(min(0.70, (done / total) * 0.70))
+            progress.progress(min(0.75, (done / total) * 0.75))
+            if done % 50 == 0 or done == total:
+                log(f"Images: {done}/{total} ok={ok} missing={done-ok}")
 
-    stage.info("Stage 2/2 — Building PDF…")
+    status.info("Stage 2/2 — Building PDF…")
     progress.progress(0.85)
 
-    pdf_bytes = make_catalog_pdf(
+    pdf_bytes = make_catalog_pdf_bytes(
         filtered,
         title=st.session_state.get("catalog_title", DEFAULT_TITLE),
-        pagesize_name=st.session_state.get("pagesize_name", "A4"),
+        page_size=st.session_state.get("page_size", "A4"),
         columns=int(st.session_state.get("columns", 3)),
+        currency_symbol=st.session_state.get("currency_symbol", "£"),
         show_price=bool(st.session_state.get("show_price", True)),
         show_sku=bool(st.session_state.get("show_sku", True)),
         show_desc=bool(st.session_state.get("show_desc", True)),
         show_attrs=bool(st.session_state.get("show_attrs", True)),
         exclude_oos=bool(st.session_state.get("exclude_oos", True)),
-        currency_symbol=st.session_state.get("currency_symbol", "£"),
-        brand_site=DEFAULT_SITE,
     )
 
     st.session_state.last_pdf = pdf_bytes
     progress.progress(1.0)
-    stage.success("Ready.")
+    status.success("PDF ready.")
 
     st.download_button("Download PDF", data=pdf_bytes, file_name="bkosher_catalog.pdf", mime="application/pdf")
+    st.caption("Clickability note: Some PDF viewers ignore links. Best test: Chrome/Edge or Adobe Acrobat Reader.")
+
     st.markdown("</div>", unsafe_allow_html=True)
