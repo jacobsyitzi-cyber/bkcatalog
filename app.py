@@ -1,21 +1,5 @@
 # app.py
-# B-Kosher Customer Catalog Builder (Streamlit Cloud SAFE)
-#
-# ✅ Pure Python stack (Streamlit + requests + Pillow + fpdf2) - deploys on Streamlit Cloud
-# ✅ Login gate (password from secrets)
-# ✅ Default source = WooCommerce API (cached to disk) + optional CSV upload
-# ✅ LIVE API import progress bar + live product count + live log
-# ✅ Image download progress + retries/backoff + disk cache
-# ✅ PDF: A4, 3x3 grid (when columns=3), clickable cards, sale badge, 2dp prices
-# ✅ Fixes: HTML entities (&amp; -> &), no "nan", text wrapping, no grey behind images
-# ✅ Fix: Unicode-safe PDF text (no FPDFUnicodeEncodingException)
-# ✅ Fix: FPDF2 compatibility (NO rounded_rect; uses rect_any fallback)
-#
-# requirements.txt:
-# streamlit==1.31.1
-# requests==2.31.0
-# Pillow==10.4.0
-# fpdf2==2.7.8
+# B-Kosher Catalog Builder (Streamlit Cloud SAFE)
 
 import io
 import re
@@ -33,13 +17,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import streamlit as st
 from PIL import Image
-
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 
 # =========================
-# APP CONFIG + BRANDING
+# CONFIG / BRANDING
 # =========================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
@@ -50,81 +33,60 @@ DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-# Logo file in repo root
 LOGO_PNG_PATH = "Bkosher.png"
 
+# SAFE CSS (NOT an f-string, so CSS braces cannot break Python)
 st.markdown(
     """
-    <style>
-      .stButton > button {
-        background: __RED__ !important;
-        color: white !important;
-        border: 1px solid __RED__ !important;
-        border-radius: 10px !important;
-        font-weight: 800 !important;
-      }
-      .stButton > button:hover {
-        background: #a90d26 !important;
-        border-color: #a90d26 !important;
-      }
-      a { color: __BLUE__ !important; }
-      section[data-testid="stSidebar"] {
-        border-right: 3px solid __BLUE__;
-      }
-      div[data-testid="stProgressBar"] > div > div {
-        background-color: __BLUE__ !important;
-      }
-      .panel {
-        border: 1px solid rgba(0,0,0,0.08);
-        border-radius: 16px;
-        padding: 14px 14px 6px 14px;
-        margin: 10px 0 14px 0;
-        background: rgba(255,255,255,0.6);
-      }
-      .muted {
-        color: #6b7280;
-        font-size: 0.92rem;
-        margin-top: -4px;
-        margin-bottom: 10px;
-      }
-      .step {
-        display:flex; gap:10px; align-items:center;
-        padding: 10px 12px; border-radius: 14px;
-        background: rgba(0, 76, 151, 0.06);
-        border: 1px solid rgba(0, 76, 151, 0.15);
-        margin: 8px 0 14px 0;
-      }
-      .badge {
-        display:inline-block; padding: 2px 8px; border-radius: 999px;
-        font-weight: 700; font-size: 0.85rem;
-        border: 1px solid rgba(0,0,0,0.10);
-        background: white;
-      }
-      .badge.blue {
-        color: __BLUE__;
-        border-color: rgba(0,76,151,0.25);
-      }
-      .summary {
-        border-radius: 16px;
-        padding: 12px 14px;
-        background: rgba(0,0,0,0.03);
-        border: 1px solid rgba(0,0,0,0.08);
-      }
-      .activity {
-        border-radius: 14px;
-        padding: 10px 12px;
-        background: rgba(0,0,0,0.03);
-        border: 1px solid rgba(0,0,0,0.06);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-        font-size: 0.85rem;
-        white-space: pre-wrap;
-        max-height: 320px;
-        overflow: auto;
-      }
-    </style>
-    """.replace("__RED__", BRAND_RED_HEX).replace("__BLUE__", BRAND_BLUE_HEX),
+<style>
+  .stButton > button {
+    background: __RED__ !important;
+    color: white !important;
+    border: 1px solid __RED__ !important;
+    border-radius: 10px !important;
+    font-weight: 800 !important;
+  }
+  .stButton > button:hover {
+    background: #a90d26 !important;
+    border-color: #a90d26 !important;
+  }
+  a { color: __BLUE__ !important; }
+  section[data-testid="stSidebar"] { border-right: 3px solid __BLUE__; }
+  div[data-testid="stProgressBar"] > div > div { background-color: __BLUE__ !important; }
+
+  .bk-card {
+    border: 1px solid rgba(0,0,0,0.08);
+    border-radius: 16px;
+    padding: 14px;
+    margin: 10px 0;
+    background: rgba(255,255,255,0.7);
+  }
+  .bk-muted { color: #6b7280; font-size: 0.92rem; }
+  .bk-pill {
+    display:inline-block; padding: 2px 10px; border-radius: 999px;
+    font-weight: 800; font-size: 0.85rem;
+    border: 1px solid rgba(0,0,0,0.10);
+    background: white;
+    color: __BLUE__;
+  }
+  .bk-log {
+    border-radius: 14px;
+    padding: 10px 12px;
+    background: rgba(0,0,0,0.03);
+    border: 1px solid rgba(0,0,0,0.06);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono","Courier New", monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    max-height: 320px;
+    overflow: auto;
+  }
+</style>
+"""
+    .replace("__RED__", BRAND_RED_HEX)
+    .replace("__BLUE__", BRAND_BLUE_HEX),
     unsafe_allow_html=True,
 )
+
 
 # =========================
 # SECRETS + LOGIN
@@ -154,9 +116,7 @@ def login_gate():
         return
 
     st.title("B-Kosher Catalog Login")
-    st.write("Please enter the password to continue.")
     pw = st.text_input("Password", type="password")
-
     if st.button("Login"):
         if pw == APP_PASSWORD:
             st.session_state.authenticated = True
@@ -170,13 +130,9 @@ login_gate()
 
 
 # =========================
-# Helpers / sanitizers
+# TEXT HELPERS (Unicode safe)
 # =========================
 def pdf_safe(s: str) -> str:
-    """
-    Make text safe for built-in PDF core fonts (latin-1-ish).
-    Converts HTML entities, replaces common unicode punctuation, strips unsupported chars.
-    """
     if s is None:
         return ""
     s = str(s)
@@ -246,7 +202,6 @@ def fmt_money(symbol: str, v: float | None) -> str:
 
 
 def sanitize_url(u: str) -> str:
-    # remove consumer_key/consumer_secret from any displayed URL
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
@@ -270,7 +225,7 @@ def is_in_stock(p: dict) -> bool:
 
 
 # =========================
-# Disk caches
+# DISK CACHES
 # =========================
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
@@ -334,14 +289,13 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             if r.status_code in (429, 500, 502, 503, 504):
                 continue
             r.raise_for_status()
-            raw = r.content
-            cooked = resize_to_jpeg_bytes(raw)
-            final = cooked if cooked else raw
+            cooked = resize_to_jpeg_bytes(r.content)
+            final = cooked if cooked else r.content
             write_image_cache(url, final)
             return final
         except Exception as e:
             if log_cb and attempt == retries:
-                log_cb(f"Image failed (giving up): {url[:80]}… ({type(e).__name__})")
+                log_cb(f"Image failed: {url[:80]}… ({type(e).__name__})")
             continue
     return None
 
@@ -372,7 +326,7 @@ def api_cache_save(products_raw: list[dict]):
 
 
 # =========================
-# Woo API fetch (LIVE progress)
+# WOO API (LIVE PROGRESS)
 # =========================
 def wc_fetch_products(
     base_url: str,
@@ -416,14 +370,12 @@ def wc_fetch_products(
                 time.sleep(min(0.8 * (2 ** (attempt - 1)), 20.0))
             try:
                 r = session.get(endpoint, params=params, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
-
                 if r.status_code in (401, 403):
                     try:
                         j = r.json()
                         raise RuntimeError(f"{j.get('code')} ({r.status_code}): {j.get('message')}")
                     except Exception:
                         raise RuntimeError(f"Unauthorized ({r.status_code}). Check Woo REST API permissions.")
-
                 if r.status_code >= 400:
                     raise RuntimeError(f"API request failed ({r.status_code}) at {sanitize_url(r.url)}")
 
@@ -449,7 +401,6 @@ def wc_fetch_products(
                 page += 1
                 if page % 10 == 0:
                     time.sleep(0.25)
-
                 last_exc = None
                 break
 
@@ -520,7 +471,7 @@ def get_products_from_api_or_cache_live(
         cached_raw, fetched_at = api_cache_load()
         if cached_raw is not None:
             if log_cb:
-                log_cb(f"Loaded {len(cached_raw)} products from disk cache ({fetched_at}).")
+                log_cb(f"Loaded {len(cached_raw)} products from cache ({fetched_at}).")
             if progress_cb:
                 progress_cb(1.0)
             normalized = [wc_to_product(p) for p in cached_raw]
@@ -541,7 +492,7 @@ def get_products_from_api_or_cache_live(
 
 
 # =========================
-# CSV loader
+# CSV LOADER
 # =========================
 def read_csv_bytes(uploaded_file) -> list[dict]:
     content = uploaded_file.getvalue()
@@ -549,9 +500,7 @@ def read_csv_bytes(uploaded_file) -> list[dict]:
         text = content.decode("utf-8")
     except Exception:
         text = content.decode("latin-1", errors="replace")
-
-    reader = csv.DictReader(io.StringIO(text))
-    return list(reader)
+    return list(csv.DictReader(io.StringIO(text)))
 
 
 def best_key(keys: list[str], candidates: list[str]) -> str | None:
@@ -563,23 +512,15 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
 
 
 # =========================
-# PDF helpers (FPDF2 compatibility)
+# PDF (FPDF2 compatible, no rounded_rect dependency)
 # =========================
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
 
 
-def rect_any(pdf: FPDF, x: float, y: float, w: float, h: float, r: float, style: str):
-    """
-    Use rounded_rect if available; otherwise fallback to rect.
-    Avoids crashes when rounded_rect is missing.
-    """
-    if hasattr(pdf, "rounded_rect"):
-        # Some versions: rounded_rect(x,y,w,h,r,style=...)
-        pdf.rounded_rect(x, y, w, h, r, style=style)
-    else:
-        pdf.rect(x, y, w, h, style=style)
+def rect_any(pdf: FPDF, x: float, y: float, w: float, h: float, style: str):
+    pdf.rect(x, y, w, h, style=style)
 
 
 class CatalogPDF(FPDF):
@@ -596,11 +537,12 @@ class CatalogPDF(FPDF):
     def header(self):
         left = 12
         top = 10
+        title_x = left
         try:
             self.image(self.logo_path, x=left, y=top, h=11)
             title_x = left + 38
         except Exception:
-            title_x = left
+            pass
 
         self.set_text_color(*self.blue)
         self.set_font("Helvetica", "B", 13)
@@ -637,33 +579,6 @@ def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
     while t and pdf.get_string_width(t + ell) > max_w:
         t = t[:-1]
     return (t + ell) if t else ell
-
-
-def draw_sale_badge(pdf: FPDF, x: float, y: float, w: float, p: dict, currency: str):
-    reg = p.get("regular_price")
-    sale = p.get("sale_price")
-    if not p.get("on_sale") or sale is None or reg is None or sale >= reg:
-        return
-
-    badge_w = 26
-    badge_h = 9
-    bx = x + w - badge_w - 3
-    by = y + 3
-
-    pdf.set_fill_color(*hex_to_rgb(BRAND_RED_HEX))
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 9)
-    rect_any(pdf, bx, by, badge_w, badge_h, 2, style="F")
-    pdf.set_xy(bx, by + 1.7)
-    pdf.cell(badge_w, 6, "SALE", align="C")
-
-    save_amt = reg - sale
-    save_pct = (save_amt / reg) * 100 if reg else 0
-    pdf.set_text_color(17, 24, 39)
-    pdf.set_font("Helvetica", "", 7.5)
-    pdf.set_xy(x, by + badge_h + 1)
-    msg = pdf_safe(f"Save {currency}{save_amt:.2f} ({save_pct:.0f}%)")
-    pdf.cell(w - 2, 4, msg, align="R")
 
 
 def make_catalog_pdf_bytes(
@@ -717,7 +632,7 @@ def make_catalog_pdf_bytes(
 
     cats, grouped = grouped_products()
 
-    # Contents page
+    # Contents
     pdf.add_page()
     pdf.set_text_color(*hex_to_rgb(BRAND_BLUE_HEX))
     pdf.set_font("Helvetica", "B", 20)
@@ -734,10 +649,9 @@ def make_catalog_pdf_bytes(
     cat_first = {}
     for cat in cats:
         n = len(grouped.get(cat, []))
-        if n == 0:
-            continue
-        cat_first[cat] = page_no
-        page_no += math.ceil(n / per_page)
+        if n:
+            cat_first[cat] = page_no
+            page_no += math.ceil(n / per_page)
 
     pdf.set_text_color(17, 24, 39)
     pdf.set_font("Helvetica", "", 11)
@@ -745,14 +659,7 @@ def make_catalog_pdf_bytes(
     for cat in cats:
         if y > pdf.h - 30:
             pdf.add_page()
-            pdf.set_font("Helvetica", "B", 16)
-            pdf.set_text_color(*hex_to_rgb(BRAND_BLUE_HEX))
-            pdf.set_xy(margin, 36)
-            pdf.cell(0, 10, "Contents (cont.)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.set_font("Helvetica", "", 11)
-            pdf.set_text_color(17, 24, 39)
-            y = 55
-
+            y = 40
         pdf.set_xy(margin, y)
         pdf.cell(0, 7, pdf_safe(cat))
         pdf.set_xy(pdf.w - margin - 25, y)
@@ -761,7 +668,7 @@ def make_catalog_pdf_bytes(
         pdf.set_text_color(17, 24, 39)
         y += 8
 
-    # Content pages
+    # Pages
     blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
     red_rgb = hex_to_rgb(BRAND_RED_HEX)
 
@@ -777,14 +684,14 @@ def make_catalog_pdf_bytes(
             # Category bar
             pdf.set_fill_color(*blue_rgb)
             bar_y = header_space
-            rect_any(pdf, margin, bar_y, pdf.w - 2 * margin, category_bar_h, 3, style="F")
+            rect_any(pdf, margin, bar_y, pdf.w - 2 * margin, category_bar_h, style="F")
             pdf.set_text_color(255, 255, 255)
             pdf.set_font("Helvetica", "B", 11)
             pdf.set_xy(margin + 4, bar_y + 2.2)
             pdf.cell(0, 6, pdf_safe(cat))
 
-            # Cards grid
             start_y = header_space + category_bar_h + 6
+
             for r in range(rows):
                 yy = start_y + r * (card_h + gutter)
                 xx = margin
@@ -797,15 +704,12 @@ def make_catalog_pdf_bytes(
                     # Card
                     pdf.set_draw_color(*blue_rgb)
                     pdf.set_line_width(0.5)
-                    rect_any(pdf, xx, yy, card_w, card_h, 3, style="D")
+                    rect_any(pdf, xx, yy, card_w, card_h, style="D")
 
-                    # Clickable link
+                    # Link
                     url = safe_text(p.get("url"))
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
-
-                    # Sale badge
-                    draw_sale_badge(pdf, xx, yy, card_w, p, currency_symbol)
 
                     pad = 3.5
                     img_h = card_h * 0.48
@@ -825,16 +729,15 @@ def make_catalog_pdf_bytes(
                         pdf.set_xy(xx, img_y + img_h / 2 - 2)
                         pdf.cell(card_w, 4, "No image", align="C")
 
-                    # Text area
+                    # Text region
                     text_top = img_y + img_h + 2
                     tx = xx + pad
                     max_w = card_w - 2 * pad
 
-                    # Product name (single line)
+                    # Name
                     pdf.set_text_color(0, 0, 0)
                     pdf.set_font("Helvetica", "B", 9.5)
-                    name = safe_text(p.get("name")).replace("\n", " ")
-                    name = truncate_to_fit(pdf, name, max_w)
+                    name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
                     pdf.set_xy(tx, text_top)
                     pdf.cell(max_w, 4.5, name)
 
@@ -883,7 +786,7 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
-                    # Attributes (max 2 lines)
+                    # Attributes (max 2)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -903,7 +806,7 @@ def make_catalog_pdf_bytes(
                                 line_y += 4.0
                                 shown += 1
 
-                    # Description (wrap, max 2 lines)
+                    # Description (wrap 2 lines)
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -935,7 +838,7 @@ def make_catalog_pdf_bytes(
 
 
 # =========================
-# UI state
+# STREAMLIT UI
 # =========================
 if "step" not in st.session_state:
     st.session_state.step = 1
@@ -943,105 +846,60 @@ if "products_raw" not in st.session_state:
     st.session_state.products_raw = []
 if "products_filtered" not in st.session_state:
     st.session_state.products_filtered = []
-if "last_pdf" not in st.session_state:
-    st.session_state.last_pdf = None
 
 
-# =========================
-# Sidebar
-# =========================
 with st.sidebar:
-    st.markdown("### B-Kosher")
     try:
         st.image(LOGO_PNG_PATH, width=190)
     except Exception:
         st.caption("Logo missing: upload Bkosher.png to repo root")
 
     if WC_URL and WC_CK and WC_CS:
-        st.success("Woo API configured (secrets)")
+        st.success("Woo API configured")
     else:
-        st.warning("Woo API secrets missing (API mode won't work)")
+        st.warning("Woo API secrets missing")
 
     cached_raw, cached_at = api_cache_load()
     if cached_raw is not None:
-        st.info(f"API cache: {len(cached_raw):,} items\n\nLast fetch: {cached_at}")
+        st.info(f"API cache: {len(cached_raw):,}\nLast fetch: {cached_at}")
 
-    st.markdown("---")
     if st.button("Logout"):
         st.session_state.authenticated = False
         st.rerun()
 
-    if st.button("🔄 Reset (start over)"):
+    if st.button("Reset"):
         for k in list(st.session_state.keys()):
-            if k not in ("_stcore",):
-                del st.session_state[k]
+            del st.session_state[k]
         st.rerun()
 
 
 st.title("Customer Catalog Builder")
+st.caption("API is the default. CSV is available as a backup.")
 
 
-def step_indicator(step: int):
-    labels = {
-        1: "Step 1 — Choose data source",
-        2: "Step 2 — Load products",
-        3: "Step 3 — Filter & layout",
-        4: "Step 4 — Generate & download",
-    }
-    st.markdown(
-        f"""
-        <div class="step">
-          <span class="badge blue">Step {step}/4</span>
-          <div><b>{labels.get(step,"")}</b></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-# =========================
-# Step 1 — Choose source (DEFAULT = API)
-# =========================
-step_indicator(st.session_state.step)
-
-st.markdown('<div class="panel">', unsafe_allow_html=True)
-st.markdown("### Data source")
-st.markdown('<div class="muted">Default is WooCommerce API (cached). CSV upload is available as a fallback.</div>', unsafe_allow_html=True)
-
-data_source = st.radio(
-    "Source",
-    ["WooCommerce API", "CSV Upload"],
-    index=0,
-    horizontal=True,
-    key="data_source",
-)
-
-st.markdown("</div>", unsafe_allow_html=True)
-
-if st.button("Continue → Load products"):
+# Step 1
+st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+st.markdown('<span class="bk-pill">Step 1</span>  Choose data source', unsafe_allow_html=True)
+data_source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
+if st.button("Continue"):
     st.session_state.step = 2
     st.rerun()
+st.markdown("</div>", unsafe_allow_html=True)
 
 
-# =========================
-# Step 2 — Load products
-# =========================
+# Step 2
 if st.session_state.step >= 2:
-    step_indicator(2)
-
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("### Load products")
-    st.markdown('<div class="muted">API mode uses a disk cache for speed. CSV mode loads instantly.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+    st.markdown('<span class="bk-pill">Step 2</span>  Load products', unsafe_allow_html=True)
+    st.markdown('<div class="bk-muted">API mode supports cache + live progress log.</div>', unsafe_allow_html=True)
 
     if data_source == "CSV Upload":
-        base_url = st.text_input("Base URL (used to build links if CSV has none)", value=DEFAULT_BASE_URL)
-        csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"], key="csv_file")
-        load_btn = st.button("Load products from CSV", disabled=(csv_file is None))
-
-        if load_btn:
+        base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
+        csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"])
+        if st.button("Load CSV", disabled=(csv_file is None)):
             rows = read_csv_bytes(csv_file)
             if not rows:
-                st.error("CSV looks empty.")
+                st.error("CSV empty.")
                 st.stop()
 
             keys = list(rows[0].keys())
@@ -1064,9 +922,7 @@ if st.session_state.step >= 2:
                     continue
 
                 sku = safe_text(row.get(col_sku)) if col_sku else ""
-                cats = []
-                if col_cats:
-                    cats = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()]
+                cats = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()] if col_cats else []
                 desc = strip_html(row.get(col_desc)) if col_desc else ""
 
                 reg = parse_money(row.get(col_reg)) if col_reg else None
@@ -1125,35 +981,29 @@ if st.session_state.step >= 2:
 
     else:
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
+        colA, colB = st.columns(2)
+        load_btn = colA.button("Load (use cache if available)")
+        refresh_btn = colB.button("Refresh cache (fetch again)")
 
-        c1, c2 = st.columns(2)
-        with c1:
-            load_cached_btn = st.button("Load products (use cache if available)")
-        with c2:
-            refresh_btn = st.button("Refresh cache (fetch again)")
-
-        if load_cached_btn or refresh_btn:
+        if load_btn or refresh_btn:
             prog = st.progress(0.0)
             status = st.empty()
-            loaded_count = st.empty()
+            count_box = st.empty()
             log_box = st.empty()
             logs = []
 
-            def log(msg):
+            def log(msg: str):
                 logs.append(msg)
-                log_box.markdown(
-                    f"<div class='activity'>{html.escape(chr(10).join(logs[-18:]))}</div>",
-                    unsafe_allow_html=True
-                )
+                log_box.markdown(f"<div class='bk-log'>{html.escape(chr(10).join(logs[-18:]))}</div>", unsafe_allow_html=True)
 
-            def set_progress(v):
+            def set_progress(v: float):
                 prog.progress(max(0.0, min(1.0, float(v))))
 
-            def set_count(n):
-                loaded_count.info(f"Products loaded so far: {n:,}")
+            def set_count(n: int):
+                count_box.info(f"Products loaded so far: {n:,}")
 
             try:
-                status.info("Fetching products from WooCommerce API…")
+                status.info("Fetching products from API…")
                 products, fetched_at, source = get_products_from_api_or_cache_live(
                     WC_URL, WC_CK, WC_CS,
                     timeout=api_timeout,
@@ -1164,7 +1014,6 @@ if st.session_state.step >= 2:
                 )
                 status.success("Done.")
                 set_progress(1.0)
-
                 st.session_state.products_raw = products
                 st.session_state.step = 3
                 st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
@@ -1176,91 +1025,70 @@ if st.session_state.step >= 2:
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-# =========================
-# Step 3 — Filter & layout
-# =========================
+# Step 3
 if st.session_state.step >= 3:
-    step_indicator(3)
     products = st.session_state.products_raw
+    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+    st.markdown('<span class="bk-pill">Step 3</span>  Filter & layout', unsafe_allow_html=True)
 
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("### Filter & layout")
-    st.markdown('<div class="muted">Choose what appears in the catalog and how it looks.</div>', unsafe_allow_html=True)
+    title = st.text_input("Catalog title", value=DEFAULT_TITLE)
+    page_size = st.selectbox("Page size", ["A4", "Letter"], index=0)
+    columns = st.selectbox("Cards per row", [1, 2, 3], index=2)
+    currency = st.text_input("Currency symbol", value="£")
+    preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
 
-    c1, c2, c3 = st.columns([1.2, 1, 1])
-    with c1:
-        st.session_state.catalog_title = st.text_input("Catalog title", value=st.session_state.get("catalog_title", DEFAULT_TITLE))
-    with c2:
-        st.session_state.page_size = st.selectbox("Page size", ["A4", "Letter"], index=0)
-        st.session_state.columns = st.selectbox("Cards per row", [1, 2, 3], index=2)
-    with c3:
-        st.session_state.currency_symbol = st.text_input("Currency symbol", value=st.session_state.get("currency_symbol", "£"))
-        st.session_state.preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
+    show_price = st.checkbox("Show price", value=True)
+    show_sku = st.checkbox("Show SKU", value=True)
+    show_desc = st.checkbox("Show description", value=True)
+    show_attrs = st.checkbox("Show attributes", value=True)
+    exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
 
     all_cats = sorted({c for p in products for c in (p.get("categories") or []) if c}, key=lambda s: s.lower())
-    st.session_state.selected_cats = st.multiselect("Categories (optional)", all_cats, default=st.session_state.get("selected_cats", []))
-    st.session_state.search = st.text_input("Search (name or SKU)", value=st.session_state.get("search", ""))
-
-    t1, t2, t3, t4, t5 = st.columns(5)
-    with t1:
-        st.session_state.show_price = st.checkbox("Price", value=st.session_state.get("show_price", True))
-    with t2:
-        st.session_state.show_sku = st.checkbox("SKU", value=st.session_state.get("show_sku", True))
-    with t3:
-        st.session_state.show_desc = st.checkbox("Description", value=st.session_state.get("show_desc", True))
-    with t4:
-        st.session_state.show_attrs = st.checkbox("Attributes", value=st.session_state.get("show_attrs", True))
-    with t5:
-        st.session_state.exclude_oos = st.checkbox("Exclude out-of-stock", value=st.session_state.get("exclude_oos", True))
+    selected_cats = st.multiselect("Categories (optional)", all_cats, default=[])
+    q = st.text_input("Search (name or SKU)", value="").strip().lower()
 
     filtered = products[:]
-    if st.session_state.selected_cats:
-        sset = set(st.session_state.selected_cats)
+    if selected_cats:
+        sset = set(selected_cats)
         filtered = [p for p in filtered if set(p.get("categories") or []).intersection(sset)]
-
-    q = st.session_state.search.strip().lower()
     if q:
         filtered = [p for p in filtered if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())]
-
-    if st.session_state.exclude_oos:
+    if exclude_oos:
         filtered = [p for p in filtered if is_in_stock(p)]
 
     filtered.sort(key=lambda p: (primary_category(p).lower(), safe_text(p.get("name")).lower()))
     st.session_state.products_filtered = filtered
 
-    sale_count = sum(1 for p in filtered if p.get("on_sale"))
-    missing_img = sum(1 for p in filtered if not p.get("_img_url"))
-    missing_url = sum(1 for p in filtered if not safe_text(p.get("url")).startswith("http"))
-
-    st.markdown(
-        f"""
-        <div class="summary">
-          <b>Catalog summary</b><br>
-          Products: <b>{len(filtered):,}</b> • On sale: <b>{sale_count:,}</b><br>
-          Missing image URLs: <b>{missing_img:,}</b> • Missing clickable URLs: <b>{missing_url:,}</b>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.info(f"Selected products: {len(filtered):,}")
 
     if st.button("Continue → Generate PDF", disabled=(len(filtered) == 0)):
         st.session_state.step = 4
+        st.session_state._pdf_settings = {
+            "title": title,
+            "page_size": page_size,
+            "columns": int(columns),
+            "currency": currency,
+            "preset": preset,
+            "show_price": bool(show_price),
+            "show_sku": bool(show_sku),
+            "show_desc": bool(show_desc),
+            "show_attrs": bool(show_attrs),
+            "exclude_oos": bool(exclude_oos),
+        }
         st.rerun()
 
+    st.markdown("</div>", unsafe_allow_html=True)
 
-# =========================
-# Step 4 — Download images + build PDF
-# =========================
+
+# Step 4
 if st.session_state.step >= 4:
-    step_indicator(4)
     filtered = st.session_state.products_filtered
-    if not filtered:
-        st.error("No products selected.")
-        st.stop()
+    settings = st.session_state.get("_pdf_settings", {})
 
-    preset = st.session_state.get("preset", "Reliable")
+    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+    st.markdown('<span class="bk-pill">Step 4</span>  Generate & download', unsafe_allow_html=True)
+
+    preset = settings.get("preset", "Reliable")
     if preset == "Reliable":
         dl_workers, dl_retries, dl_timeout, dl_backoff = 4, 10, 25, 0.9
     elif preset == "Normal":
@@ -1268,19 +1096,15 @@ if st.session_state.step >= 4:
     else:
         dl_workers, dl_retries, dl_timeout, dl_backoff = 10, 3, 12, 0.5
 
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("### Generate & download")
-    st.markdown('<div class="muted">Downloading images (cached + retries), then building the PDF.</div>', unsafe_allow_html=True)
-
     progress = st.progress(0.0)
     status = st.empty()
-    activity_box = st.empty()
-    activity = []
+    log_box = st.empty()
+    logs = []
     t0 = time.time()
 
     def log(msg: str):
-        activity.append(f"[{time.time()-t0:6.1f}s] {msg}")
-        activity_box.markdown(f"<div class='activity'>{html.escape(chr(10).join(activity[-22:]))}</div>", unsafe_allow_html=True)
+        logs.append(f"[{time.time()-t0:6.1f}s] {msg}")
+        log_box.markdown(f"<div class='bk-log'>{html.escape(chr(10).join(logs[-22:]))}</div>", unsafe_allow_html=True)
 
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
@@ -1301,8 +1125,6 @@ if st.session_state.step >= 4:
             if b:
                 p["_image_path"] = str(cache_path_for_url(p["_img_url"]))
                 ok += 1
-            else:
-                p["_image_path"] = None
             done += 1
             progress.progress(min(0.75, (done / total) * 0.75))
             if done % 50 == 0 or done == total:
@@ -1313,21 +1135,19 @@ if st.session_state.step >= 4:
 
     pdf_bytes = make_catalog_pdf_bytes(
         filtered,
-        title=st.session_state.get("catalog_title", DEFAULT_TITLE),
-        page_size=st.session_state.get("page_size", "A4"),
-        columns=int(st.session_state.get("columns", 3)),
-        currency_symbol=st.session_state.get("currency_symbol", "£"),
-        show_price=bool(st.session_state.get("show_price", True)),
-        show_sku=bool(st.session_state.get("show_sku", True)),
-        show_desc=bool(st.session_state.get("show_desc", True)),
-        show_attrs=bool(st.session_state.get("show_attrs", True)),
-        exclude_oos=bool(st.session_state.get("exclude_oos", True)),
+        title=settings.get("title", DEFAULT_TITLE),
+        page_size=settings.get("page_size", "A4"),
+        columns=int(settings.get("columns", 3)),
+        currency_symbol=settings.get("currency", "£"),
+        show_price=bool(settings.get("show_price", True)),
+        show_sku=bool(settings.get("show_sku", True)),
+        show_desc=bool(settings.get("show_desc", True)),
+        show_attrs=bool(settings.get("show_attrs", True)),
+        exclude_oos=bool(settings.get("exclude_oos", True)),
     )
 
-    st.session_state.last_pdf = pdf_bytes
     progress.progress(1.0)
     status.success("PDF ready.")
 
     st.download_button("Download PDF", data=pdf_bytes, file_name="bkosher_catalog.pdf", mime="application/pdf")
-    st.caption("Clickability note: Some PDF viewers ignore links. Best test: Chrome/Edge or Adobe Acrobat Reader.")
     st.markdown("</div>", unsafe_allow_html=True)
