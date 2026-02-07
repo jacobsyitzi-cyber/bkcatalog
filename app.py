@@ -808,11 +808,10 @@ def make_catalog_pdf_bytes(
 
                     xx += card_w + gutter
 
-    out = pdf.output(dest="S")
+        out = pdf.output(dest="S")
     if isinstance(out, str):
-        out = out.encode("latin1", "ignore")
+        out = out.encode("latin-1", "ignore")
     return out
-
 
 # =========================
 # UI (ONLY UI BELOW THIS LINE)
@@ -1118,5 +1117,15 @@ if st.session_state.step >= 4:
 
     progress.progress(1.0)
     status.success("PDF ready.")
-    st.download_button("Download PDF", data=pdf_bytes, file_name="bkosher_catalog.pdf", mime="application/pdf")
+    # Ensure Streamlit receives true bytes
+if isinstance(pdf_bytes, str):
+    pdf_bytes = pdf_bytes.encode("latin-1", "ignore")
+elif not isinstance(pdf_bytes, (bytes, bytearray)):
+    pdf_bytes = bytes(pdf_bytes)
+
+st.download_button(
+    "Download PDF",
+    data=pdf_bytes,
+    file_name="bkosher_catalog.pdf",
+    mime="application/pdf",
     st.caption("If links don’t work in your viewer, test in Chrome/Edge or Adobe Acrobat Reader.")
