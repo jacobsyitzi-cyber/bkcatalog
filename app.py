@@ -1,5 +1,4 @@
-# app.py
-# B-Kosher Catalog Builder (Streamlit Cloud SAFE)
+# app.py — B-Kosher Catalog Builder (stable rewrite)
 
 import io
 import re
@@ -17,12 +16,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import streamlit as st
 from PIL import Image
+
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 
 # =========================
-# CONFIG / BRANDING
+# CONFIG / BRAND
 # =========================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
@@ -35,7 +35,6 @@ DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
 LOGO_PNG_PATH = "Bkosher.png"
 
-# SAFE CSS (NOT an f-string, so CSS braces cannot break Python)
 st.markdown(
     """
 <style>
@@ -53,23 +52,7 @@ st.markdown(
   a { color: __BLUE__ !important; }
   section[data-testid="stSidebar"] { border-right: 3px solid __BLUE__; }
   div[data-testid="stProgressBar"] > div > div { background-color: __BLUE__ !important; }
-
-  .bk-card {
-    border: 1px solid rgba(0,0,0,0.08);
-    border-radius: 16px;
-    padding: 14px;
-    margin: 10px 0;
-    background: rgba(255,255,255,0.7);
-  }
-  .bk-muted { color: #6b7280; font-size: 0.92rem; }
-  .bk-pill {
-    display:inline-block; padding: 2px 10px; border-radius: 999px;
-    font-weight: 800; font-size: 0.85rem;
-    border: 1px solid rgba(0,0,0,0.10);
-    background: white;
-    color: __BLUE__;
-  }
-  .bk-log {
+  .mono {
     border-radius: 14px;
     padding: 10px 12px;
     background: rgba(0,0,0,0.03);
@@ -104,7 +87,7 @@ WC_CS = get_secret("WC_CS", "")
 APP_PASSWORD = get_secret("APP_PASSWORD", "")
 
 
-def login_gate():
+def login_gate() -> None:
     if not APP_PASSWORD:
         st.error("APP_PASSWORD is not set in Streamlit secrets.")
         st.stop()
@@ -126,13 +109,11 @@ def login_gate():
     st.stop()
 
 
-login_gate()
-
-
 # =========================
-# TEXT HELPERS (Unicode safe)
+# TEXT HELPERS
 # =========================
 def pdf_safe(s: str) -> str:
+    """Make text safe for FPDF core fonts (latin-1-ish), and unescape HTML entities."""
     if s is None:
         return ""
     s = str(s)
@@ -202,6 +183,7 @@ def fmt_money(symbol: str, v: float | None) -> str:
 
 
 def sanitize_url(u: str) -> str:
+    """Remove keys from any URL we might display in errors/logs."""
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
@@ -250,7 +232,7 @@ def read_image_cache(url: str) -> bytes | None:
     return None
 
 
-def write_image_cache(url: str, b: bytes):
+def write_image_cache(url: str, b: bytes) -> None:
     try:
         cache_path_for_url(url).write_bytes(b)
     except Exception:
@@ -314,7 +296,7 @@ def api_cache_load():
     return None, None
 
 
-def api_cache_save(products_raw: list[dict]):
+def api_cache_save(products_raw: list[dict]) -> None:
     payload = {
         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "products": products_raw,
@@ -326,7 +308,7 @@ def api_cache_save(products_raw: list[dict]):
 
 
 # =========================
-# WOO API (LIVE PROGRESS)
+# WOO API
 # =========================
 def wc_fetch_products(
     base_url: str,
@@ -401,6 +383,7 @@ def wc_fetch_products(
                 page += 1
                 if page % 10 == 0:
                     time.sleep(0.25)
+
                 last_exc = None
                 break
 
@@ -492,7 +475,7 @@ def get_products_from_api_or_cache_live(
 
 
 # =========================
-# CSV LOADER
+# CSV
 # =========================
 def read_csv_bytes(uploaded_file) -> list[dict]:
     content = uploaded_file.getvalue()
@@ -512,15 +495,11 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
 
 
 # =========================
-# PDF (FPDF2 compatible, no rounded_rect dependency)
+# PDF
 # =========================
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
-
-
-def rect_any(pdf: FPDF, x: float, y: float, w: float, h: float, style: str):
-    pdf.rect(x, y, w, h, style=style)
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
 class CatalogPDF(FPDF):
@@ -563,7 +542,6 @@ class CatalogPDF(FPDF):
         self.set_draw_color(*self.red)
         self.set_line_width(0.5)
         self.line(12, y, self.w - 12, y)
-
         self.set_text_color(55, 65, 81)
         self.set_font("Helvetica", "", 8)
         self.set_xy(12, y + 2)
@@ -593,7 +571,7 @@ def make_catalog_pdf_bytes(
     show_desc: bool,
     show_attrs: bool,
     exclude_oos: bool,
-):
+) -> bytes:
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
 
@@ -617,7 +595,7 @@ def make_catalog_pdf_bytes(
     usable_w = pdf.w - 2 * margin
     card_w = (usable_w - (columns - 1) * gutter) / columns
 
-    rows = 3  # FIXED: 3 rows so 3x3 grid fits
+    rows = 3
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
@@ -635,7 +613,7 @@ def make_catalog_pdf_bytes(
     blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
     red_rgb = hex_to_rgb(BRAND_RED_HEX)
 
-    # ---------- Contents ----------
+    # Contents
     pdf.add_page()
     pdf.set_text_color(*blue_rgb)
     pdf.set_font("Helvetica", "B", 20)
@@ -671,7 +649,7 @@ def make_catalog_pdf_bytes(
         pdf.set_text_color(17, 24, 39)
         y += 8
 
-    # ---------- Category pages ----------
+    # Category pages
     for cat in cats:
         items = grouped.get(cat, [])
         if not items:
@@ -696,14 +674,13 @@ def make_catalog_pdf_bytes(
                 yy = start_y + r * (card_h + gutter)
                 xx = margin
 
-                for c in range(columns):
+                for _c in range(columns):
                     if idx >= len(items):
                         break
-
                     p = items[idx]
                     idx += 1
 
-                    # Card border
+                    # Card
                     pdf.set_draw_color(*blue_rgb)
                     pdf.set_line_width(0.5)
                     pdf.rect(xx, yy, card_w, card_h, style="D")
@@ -713,7 +690,7 @@ def make_catalog_pdf_bytes(
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
 
-                    # Image box
+                    # Image
                     pad = 3.5
                     img_h = card_h * 0.48
                     img_w = card_w - 2 * pad
@@ -731,13 +708,11 @@ def make_catalog_pdf_bytes(
                         pdf.set_xy(xx, img_y + img_h / 2 - 2)
                         pdf.cell(card_w, 4, "No image", align="C")
 
-                    # Text region
+                    # Text
                     tx = xx + pad
                     max_w = card_w - 2 * pad
-                    text_top = img_y + img_h + 2
-                    line_y = text_top
+                    line_y = img_y + img_h + 2
 
-                    # Name
                     pdf.set_text_color(0, 0, 0)
                     pdf.set_font("Helvetica", "B", 9.5)
                     name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
@@ -788,7 +763,7 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
-                    # Attributes (up to 2 lines)
+                    # Attributes
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -808,7 +783,7 @@ def make_catalog_pdf_bytes(
                                 line_y += 4.0
                                 shown += 1
 
-                    # Description (wrap 2 lines)
+                    # Description (2 lines)
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -840,14 +815,18 @@ def make_catalog_pdf_bytes(
 
 
 # =========================
-# STREAMLIT UI
+# UI (ONLY UI BELOW THIS LINE)
 # =========================
+login_gate()
+
 if "step" not in st.session_state:
     st.session_state.step = 1
 if "products_raw" not in st.session_state:
     st.session_state.products_raw = []
 if "products_filtered" not in st.session_state:
     st.session_state.products_filtered = []
+if "_settings" not in st.session_state:
+    st.session_state._settings = {}
 
 
 with st.sidebar:
@@ -863,7 +842,7 @@ with st.sidebar:
 
     cached_raw, cached_at = api_cache_load()
     if cached_raw is not None:
-        st.info(f"API cache: {len(cached_raw):,}\nLast fetch: {cached_at}")
+        st.info(f"API cache: {len(cached_raw):,} • Last fetch: {cached_at}")
 
     if st.button("Logout"):
         st.session_state.authenticated = False
@@ -876,29 +855,25 @@ with st.sidebar:
 
 
 st.title("Customer Catalog Builder")
-st.caption("API is the default. CSV is available as a backup.")
+st.caption("Default = WooCommerce API. CSV is available as a backup.")
 
 
 # Step 1
-st.markdown('<div class="bk-card">', unsafe_allow_html=True)
-st.markdown('<span class="bk-pill">Step 1</span>  Choose data source', unsafe_allow_html=True)
+st.subheader("Step 1 — Choose data source")
 data_source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
-if st.button("Continue"):
+if st.button("Continue → Load products"):
     st.session_state.step = 2
     st.rerun()
-st.markdown("</div>", unsafe_allow_html=True)
 
 
 # Step 2
 if st.session_state.step >= 2:
-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
-    st.markdown('<span class="bk-pill">Step 2</span>  Load products', unsafe_allow_html=True)
-    st.markdown('<div class="bk-muted">API mode supports cache + live progress log.</div>', unsafe_allow_html=True)
+    st.subheader("Step 2 — Load products")
 
     if data_source == "CSV Upload":
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
         csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"])
-        if st.button("Load CSV", disabled=(csv_file is None)):
+        if st.button("Load from CSV", disabled=(csv_file is None)):
             rows = read_csv_bytes(csv_file)
             if not rows:
                 st.error("CSV empty.")
@@ -926,7 +901,6 @@ if st.session_state.step >= 2:
                 sku = safe_text(row.get(col_sku)) if col_sku else ""
                 cats = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()] if col_cats else []
                 desc = strip_html(row.get(col_desc)) if col_desc else ""
-
                 reg = parse_money(row.get(col_reg)) if col_reg else None
                 sale = parse_money(row.get(col_sale)) if col_sale else None
                 on_sale = (sale is not None and reg is not None and sale < reg)
@@ -983,11 +957,11 @@ if st.session_state.step >= 2:
 
     else:
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
-        colA, colB = st.columns(2)
-        load_btn = colA.button("Load (use cache if available)")
-        refresh_btn = colB.button("Refresh cache (fetch again)")
+        col1, col2 = st.columns(2)
+        load_cached = col1.button("Load (use cache if available)")
+        refresh = col2.button("Refresh cache (fetch again)")
 
-        if load_btn or refresh_btn:
+        if load_cached or refresh:
             prog = st.progress(0.0)
             status = st.empty()
             count_box = st.empty()
@@ -996,7 +970,7 @@ if st.session_state.step >= 2:
 
             def log(msg: str):
                 logs.append(msg)
-                log_box.markdown(f"<div class='bk-log'>{html.escape(chr(10).join(logs[-18:]))}</div>", unsafe_allow_html=True)
+                log_box.markdown(f"<div class='mono'>{html.escape(chr(10).join(logs[-18:]))}</div>", unsafe_allow_html=True)
 
             def set_progress(v: float):
                 prog.progress(max(0.0, min(1.0, float(v))))
@@ -1009,13 +983,14 @@ if st.session_state.step >= 2:
                 products, fetched_at, source = get_products_from_api_or_cache_live(
                     WC_URL, WC_CK, WC_CS,
                     timeout=api_timeout,
-                    force_refresh=bool(refresh_btn),
+                    force_refresh=bool(refresh),
                     log_cb=log,
                     progress_cb=set_progress,
                     count_cb=set_count,
                 )
                 status.success("Done.")
                 set_progress(1.0)
+
                 st.session_state.products_raw = products
                 st.session_state.step = 3
                 st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
@@ -1024,14 +999,11 @@ if st.session_state.step >= 2:
                 st.error(str(e))
                 st.stop()
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
 
 # Step 3
 if st.session_state.step >= 3:
+    st.subheader("Step 3 — Filter & layout")
     products = st.session_state.products_raw
-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
-    st.markdown('<span class="bk-pill">Step 3</span>  Filter & layout', unsafe_allow_html=True)
 
     title = st.text_input("Catalog title", value=DEFAULT_TITLE)
     page_size = st.selectbox("Page size", ["A4", "Letter"], index=0)
@@ -1065,7 +1037,7 @@ if st.session_state.step >= 3:
 
     if st.button("Continue → Generate PDF", disabled=(len(filtered) == 0)):
         st.session_state.step = 4
-        st.session_state._pdf_settings = {
+        st.session_state._settings = {
             "title": title,
             "page_size": page_size,
             "columns": int(columns),
@@ -1079,16 +1051,12 @@ if st.session_state.step >= 3:
         }
         st.rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
-
 
 # Step 4
 if st.session_state.step >= 4:
+    st.subheader("Step 4 — Generate & download")
     filtered = st.session_state.products_filtered
-    settings = st.session_state.get("_pdf_settings", {})
-
-    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
-    st.markdown('<span class="bk-pill">Step 4</span>  Generate & download', unsafe_allow_html=True)
+    settings = st.session_state._settings
 
     preset = settings.get("preset", "Reliable")
     if preset == "Reliable":
@@ -1106,7 +1074,7 @@ if st.session_state.step >= 4:
 
     def log(msg: str):
         logs.append(f"[{time.time()-t0:6.1f}s] {msg}")
-        log_box.markdown(f"<div class='bk-log'>{html.escape(chr(10).join(logs[-22:]))}</div>", unsafe_allow_html=True)
+        log_box.markdown(f"<div class='mono'>{html.escape(chr(10).join(logs[-22:]))}</div>", unsafe_allow_html=True)
 
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
@@ -1150,6 +1118,5 @@ if st.session_state.step >= 4:
 
     progress.progress(1.0)
     status.success("PDF ready.")
-
     st.download_button("Download PDF", data=pdf_bytes, file_name="bkosher_catalog.pdf", mime="application/pdf")
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.caption("If links don’t work in your viewer, test in Chrome/Edge or Adobe Acrobat Reader.")
