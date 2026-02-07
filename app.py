@@ -1,4 +1,4 @@
-# app.py — B-Kosher Catalog Builder (Full build, Streamlit Cloud safe)
+# app.py — B-Kosher Catalog Builder (Full build, bytearray-proof)
 
 import io
 import re
@@ -108,14 +108,34 @@ def login_gate():
 
 
 # =========================================================
+# BYTE SAFETY WRAPPER FOR STREAMLIT
+# =========================================================
+class BytesReader(io.BytesIO):
+    """Guarantee .read() returns bytes (never bytearray)."""
+    def read(self, *args, **kwargs):
+        data = super().read(*args, **kwargs)
+        return bytes(data)
+
+
+def to_bytes(x) -> bytes:
+    if x is None:
+        return b""
+    if isinstance(x, bytes):
+        return x
+    if isinstance(x, bytearray):
+        return bytes(x)
+    if isinstance(x, str):
+        return x.encode("latin-1", "ignore")
+    return bytes(x)
+
+
+# =========================================================
 # TEXT HELPERS
 # =========================================================
 def pdf_safe(s: str) -> str:
-    """Make text safe for FPDF core fonts + unescape HTML entities."""
     if s is None:
         return ""
-    s = str(s)
-    s = htmlmod.unescape(s)  # &amp; -> &
+    s = htmlmod.unescape(str(s))  # &amp; -> &
     s = (
         s.replace("•", " | ")
         .replace("–", "-")
@@ -169,7 +189,6 @@ def fmt_money(symbol: str, v: float | None) -> str:
 
 
 def sanitize_url(u: str) -> str:
-    """Strip keys from any URL we might display."""
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
@@ -188,8 +207,7 @@ def primary_category(p: dict) -> str:
 
 
 def is_in_stock(p: dict) -> bool:
-    s = safe_text(p.get("stock_status")).lower()
-    return s != "outofstock"
+    return safe_text(p.get("stock_status")).lower() != "outofstock"
 
 
 def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
@@ -204,7 +222,6 @@ def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
 
 
 def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
-    """Return up to 2 wrapped lines."""
     text = pdf_safe(text)
     if not text:
         return []
@@ -224,7 +241,7 @@ def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
 
 
 # =========================================================
-# DISK CACHE
+# DISK CACHE (API + IMAGES)
 # =========================================================
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
@@ -327,17 +344,7 @@ def api_cache_save(products_raw: list[dict]):
 # =========================================================
 # WOO API
 # =========================================================
-def wc_fetch_products(
-    base_url: str,
-    ck: str,
-    cs: str,
-    *,
-    per_page: int = 25,
-    timeout: int = 30,
-    log_cb=None,
-    progress_cb=None,
-    count_cb=None,
-):
+def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=30, log_cb=None, progress_cb=None, count_cb=None):
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
@@ -455,17 +462,7 @@ def wc_to_product(p: dict) -> dict:
     }
 
 
-def get_products_from_api_or_cache_live(
-    wc_url: str,
-    wc_ck: str,
-    wc_cs: str,
-    *,
-    timeout: int = 30,
-    force_refresh: bool = False,
-    log_cb=None,
-    progress_cb=None,
-    count_cb=None,
-):
+def get_products_from_api_or_cache_live(wc_url, wc_ck, wc_cs, *, timeout=30, force_refresh=False, log_cb=None, progress_cb=None, count_cb=None):
     if not force_refresh:
         cached_raw, fetched_at = api_cache_load()
         if cached_raw is not None:
@@ -491,7 +488,7 @@ def get_products_from_api_or_cache_live(
 
 
 # =========================================================
-# CSV (backup mode)
+# CSV (backup)
 # =========================================================
 def read_csv_bytes(uploaded_file) -> list[dict]:
     content = uploaded_file.getvalue()
@@ -564,19 +561,7 @@ class CatalogPDF(FPDF):
         self.cell(0, 8, pdf_safe(f"{self.brand_site} | {self.disclaimer}"))
 
 
-def make_catalog_pdf_bytes(
-    products: list[dict],
-    *,
-    title: str,
-    page_size: str,
-    columns: int,
-    currency_symbol: str,
-    show_price: bool,
-    show_sku: bool,
-    show_desc: bool,
-    show_attrs: bool,
-    exclude_oos: bool,
-) -> bytes:
+def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symbol, show_price, show_sku, show_desc, show_attrs, exclude_oos) -> bytes:
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
 
@@ -600,7 +585,7 @@ def make_catalog_pdf_bytes(
     usable_w = pdf.w - 2 * margin
     card_w = (usable_w - (columns - 1) * gutter) / columns
 
-    rows = 3  # fixed 3 rows so 3x3 fits
+    rows = 3  # fixed: 3 rows so 3x3 fits when columns=3
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
@@ -684,7 +669,7 @@ def make_catalog_pdf_bytes(
                     p = items[idx]
                     idx += 1
 
-                    # Card border
+                    # Card
                     pdf.set_draw_color(*blue_rgb)
                     pdf.set_line_width(0.5)
                     pdf.rect(xx, yy, card_w, card_h, style="D")
@@ -712,7 +697,6 @@ def make_catalog_pdf_bytes(
                         pdf.set_xy(xx, img_y + img_h / 2 - 2)
                         pdf.cell(card_w, 4, "No image", align="C")
 
-                    # Text
                     tx = xx + pad
                     max_w = card_w - 2 * pad
                     line_y = img_y + img_h + 2
@@ -767,7 +751,7 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
-                    # Attributes (2 lines max)
+                    # Attributes (2 lines)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -787,7 +771,7 @@ def make_catalog_pdf_bytes(
                                 line_y += 4.0
                                 shown += 1
 
-                    # Description (2 lines max)
+                    # Description (2 lines)
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -801,17 +785,13 @@ def make_catalog_pdf_bytes(
 
                     xx += card_w + gutter
 
-    out = pdf.output(dest="S")
-    # Convert whatever it is into strict bytes
-    if isinstance(out, str):
-        out = out.encode("latin-1", "ignore")
-    elif isinstance(out, bytearray):
-        out = bytes(out)
-    return bytes(out)
+    # IMPORTANT: Use pdf.output() (no dest). Convert to strict bytes.
+    out = pdf.output()
+    return to_bytes(out)
 
 
 # =========================================================
-# UI STARTS HERE
+# UI
 # =========================================================
 login_gate()
 
@@ -828,7 +808,7 @@ with st.sidebar:
     try:
         st.image(LOGO_PNG_PATH, width=190)
     except Exception:
-        st.caption("Logo missing: upload Bkosher.png to repo root")
+        st.caption("Logo missing: upload Bkosher.png to repo root (Bkosher.png).")
 
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured")
@@ -1127,8 +1107,8 @@ if st.session_state.step >= 4:
         exclude_oos=bool(settings.get("exclude_oos", True)),
     )
 
-    # CRITICAL: always hand Streamlit a file-like object (avoids bytearray bugs)
-    pdf_file = io.BytesIO(bytes(pdf_bytes))
+    # 100% bytearray-proof for Streamlit: file-like whose .read() returns bytes.
+    pdf_file = BytesReader(to_bytes(pdf_bytes))
     pdf_file.seek(0)
 
     progress.progress(1.0)
@@ -1136,7 +1116,7 @@ if st.session_state.step >= 4:
 
     st.download_button(
         "Download PDF",
-        data=pdf_file,  # <-- file-like, Streamlit-safe
+        data=pdf_file,
         file_name="bkosher_catalog.pdf",
         mime="application/pdf",
     )
