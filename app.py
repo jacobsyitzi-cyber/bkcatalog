@@ -1,5 +1,8 @@
-# app.py — B-Kosher Catalog Builder (Streamlit Cloud hardened)
-# Key fix: st.download_button ALWAYS receives `bytes` (never bytearray / file-like)
+# app.py — B-Kosher Catalog Builder (Streamlit Cloud SAFE build)
+# Key guarantees:
+# 1) Only ONE st.download_button exists (PDF download)
+# 2) The data passed to st.download_button is ALWAYS bytes (never bytearray)
+# 3) No function is named "log" to avoid accidental collisions/overwrites
 
 import io
 import re
@@ -7,7 +10,7 @@ import csv
 import json
 import time
 import math
-import html as htmlmod
+import html
 import hashlib
 import datetime
 from pathlib import Path
@@ -21,36 +24,44 @@ from PIL import Image
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
+# ----------------------------
+# VERSION (visible in UI)
+# ----------------------------
+APP_VERSION = "2026-02-07-v3"
 
-# =========================
-# BRAND / CONFIG
-# =========================
-st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
-
+# ----------------------------
+# BRANDING
+# ----------------------------
 BRAND_RED_HEX = "#C8102E"
 BRAND_BLUE_HEX = "#004C97"
-
 DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-LOGO_PNG_PATH = "Bkosher.png"  # make sure this exists in your repo root
+# Put your logo in repo root and name it EXACTLY:
+# Bkosher.png
+LOGO_PNG_PATH = "Bkosher.png"
+
+st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
 st.markdown(
-    """
+    f"""
 <style>
-  .stButton > button {
-    background: __RED__ !important;
+  .stButton > button {{
+    background: {BRAND_RED_HEX} !important;
     color: white !important;
-    border: 1px solid __RED__ !important;
+    border: 1px solid {BRAND_RED_HEX} !important;
     border-radius: 10px !important;
     font-weight: 800 !important;
-  }
-  .stButton > button:hover { background: #a90d26 !important; border-color: #a90d26 !important; }
-  a { color: __BLUE__ !important; }
-  section[data-testid="stSidebar"] { border-right: 3px solid __BLUE__; }
-  div[data-testid="stProgressBar"] > div > div { background-color: __BLUE__ !important; }
-  .bk_log {
+  }}
+  .stButton > button:hover {{
+    background: #a90d26 !important;
+    border-color: #a90d26 !important;
+  }}
+  a {{ color: {BRAND_BLUE_HEX} !important; }}
+  section[data-testid="stSidebar"] {{ border-right: 3px solid {BRAND_BLUE_HEX}; }}
+  div[data-testid="stProgressBar"] > div > div {{ background-color: {BRAND_BLUE_HEX} !important; }}
+  .bk_log {{
     border-radius: 14px;
     padding: 10px 12px;
     background: rgba(0,0,0,0.03);
@@ -60,32 +71,30 @@ st.markdown(
     white-space: pre-wrap;
     max-height: 360px;
     overflow: auto;
-  }
-  .bk_hint { color: #6b7280; font-size: 0.92rem; }
+  }}
+  .bk_hint {{ color: #6b7280; font-size: 0.92rem; }}
 </style>
-"""
-    .replace("__RED__", BRAND_RED_HEX)
-    .replace("__BLUE__", BRAND_BLUE_HEX),
+""",
     unsafe_allow_html=True,
 )
 
-
-# =========================
-# SECRETS + LOGIN
-# =========================
+# ----------------------------
+# Secrets helpers
+# ----------------------------
 def get_secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, default)
     except Exception:
         return default
 
-
 APP_PASSWORD = get_secret("APP_PASSWORD", "")
 WC_URL = get_secret("WC_URL", "")
 WC_CK = get_secret("WC_CK", "")
 WC_CS = get_secret("WC_CS", "")
 
-
+# ----------------------------
+# Login gate
+# ----------------------------
 def login_gate():
     if not APP_PASSWORD:
         st.error("APP_PASSWORD is not set in Streamlit secrets.")
@@ -103,16 +112,13 @@ def login_gate():
         if pw == APP_PASSWORD:
             st.session_state.authenticated = True
             st.rerun()
-        else:
-            st.error("Incorrect password.")
+        st.error("Incorrect password.")
     st.stop()
 
-
-# =========================
-# HARD FIX: ONLY BYTES
-# =========================
+# ----------------------------
+# Strict bytes conversion (THE FIX)
+# ----------------------------
 def strict_bytes(x) -> bytes:
-    """Convert anything we might get into true bytes. Never returns bytearray."""
     if x is None:
         return b""
     if isinstance(x, bytes):
@@ -123,14 +129,13 @@ def strict_bytes(x) -> bytes:
         return x.encode("latin-1", "ignore")
     return bytes(x)
 
-
-# =========================
-# TEXT HELPERS
-# =========================
+# ----------------------------
+# Text cleanup helpers
+# ----------------------------
 def pdf_safe(s: str) -> str:
     if s is None:
         return ""
-    s = htmlmod.unescape(str(s))  # &amp; -> &
+    s = html.unescape(str(s))  # &amp; -> &
     s = (
         s.replace("•", " | ")
         .replace("–", "-")
@@ -147,7 +152,6 @@ def pdf_safe(s: str) -> str:
     except Exception:
         return s.encode("latin-1", "ignore").decode("latin-1")
 
-
 def safe_text(v) -> str:
     if v is None:
         return ""
@@ -156,7 +160,6 @@ def safe_text(v) -> str:
         return ""
     return pdf_safe(s)
 
-
 def strip_html(s: str) -> str:
     s = safe_text(s)
     if not s:
@@ -164,7 +167,6 @@ def strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
-
 
 def parse_money(v) -> float | None:
     s = safe_text(v)
@@ -176,23 +178,20 @@ def parse_money(v) -> float | None:
     except Exception:
         return None
 
-
 def fmt_money(symbol: str, v: float | None) -> str:
     if v is None:
         return ""
     return f"{symbol}{v:.2f}"
-
 
 def sanitize_url(u: str) -> str:
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
         q = [(k, v) for (k, v) in q if k not in ("consumer_key", "consumer_secret")]
-        clean_query = urlencode(q)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, clean_query, parts.fragment))
+        clean = urlencode(q)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, clean, parts.fragment))
     except Exception:
         return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
-
 
 def primary_category(p: dict) -> str:
     cats = p.get("categories") or []
@@ -200,28 +199,24 @@ def primary_category(p: dict) -> str:
         return safe_text(cats[0]) or "Other"
     return "Other"
 
-
 def is_in_stock(p: dict) -> bool:
     return safe_text(p.get("stock_status")).lower() != "outofstock"
 
-
 def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
-    text = pdf_safe(text)
-    if pdf.get_string_width(text) <= max_w:
-        return text
+    t = pdf_safe(text)
+    if pdf.get_string_width(t) <= max_w:
+        return t
     ell = "..."
-    t = text
     while t and pdf.get_string_width(t + ell) > max_w:
         t = t[:-1]
     return (t + ell) if t else ell
-
 
 def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
     text = pdf_safe(text)
     if not text:
         return []
     words = text.split()
-    lines = []
+    out = []
     for _ in range(2):
         if not words:
             break
@@ -231,25 +226,21 @@ def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
         if not line:
             line = truncate_to_fit(pdf, " ".join(words), max_w)
             words = []
-        lines.append(line)
-    return lines
+        out.append(line)
+    return out
 
-
-# =========================
-# DISK CACHE (API + IMAGES)
-# =========================
+# ----------------------------
+# Cache dirs
+# ----------------------------
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
-
 API_CACHE_DIR = Path("./api_cache")
 API_CACHE_DIR.mkdir(exist_ok=True)
 API_CACHE_FILE = API_CACHE_DIR / "products.json"
 
-
 def cache_path_for_url(url: str) -> Path:
     h = hashlib.sha1(url.encode("utf-8")).hexdigest()
     return IMAGE_CACHE_DIR / f"{h}.jpg"
-
 
 def read_image_cache(url: str) -> bytes | None:
     p = cache_path_for_url(url)
@@ -260,13 +251,11 @@ def read_image_cache(url: str) -> bytes | None:
             return None
     return None
 
-
 def write_image_cache(url: str, b: bytes):
     try:
         cache_path_for_url(url).write_bytes(b)
     except Exception:
         pass
-
 
 def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> bytes | None:
     try:
@@ -281,8 +270,7 @@ def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> by
     except Exception:
         return None
 
-
-def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float, log_cb=None) -> bytes | None:
+def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float, append_log=None) -> bytes | None:
     if not url or not url.startswith("http"):
         return None
 
@@ -305,11 +293,10 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             write_image_cache(url, final)
             return final
         except Exception as e:
-            if log_cb and attempt == retries:
-                log_cb(f"Image failed: {url[:80]}… ({type(e).__name__})")
+            if append_log and attempt == retries:
+                append_log(f"Image failed: {url[:70]}… ({type(e).__name__})")
             continue
     return None
-
 
 def api_cache_load():
     if not API_CACHE_FILE.exists():
@@ -324,7 +311,6 @@ def api_cache_load():
         pass
     return None, None
 
-
 def api_cache_save(products_raw: list[dict]):
     payload = {
         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -335,11 +321,10 @@ def api_cache_save(products_raw: list[dict]):
     except Exception:
         pass
 
-
-# =========================
-# WOO API
-# =========================
-def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=30, log_cb=None, progress_cb=None, count_cb=None):
+# ----------------------------
+# Woo API fetch
+# ----------------------------
+def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=30, append_log=None, set_progress=None, set_count=None):
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
@@ -352,6 +337,11 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
     retries = 8
 
     while True:
+        if append_log:
+            append_log(f"API: fetching page {page}…")
+        if set_progress:
+            set_progress(min(0.90, 0.03 + page * 0.01))
+
         params = {
             "consumer_key": ck,
             "consumer_secret": cs,
@@ -359,11 +349,6 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
             "page": page,
             "status": "publish",
         }
-
-        if log_cb:
-            log_cb(f"API: fetching page {page}…")
-        if progress_cb:
-            progress_cb(min(0.90, 0.02 + (page * 0.01)))
 
         last_exc = None
         for attempt in range(retries + 1):
@@ -382,21 +367,21 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
 
                 batch = r.json()
                 if not batch:
-                    if log_cb:
-                        log_cb("API: no more products.")
-                    if progress_cb:
-                        progress_cb(1.0)
+                    if append_log:
+                        append_log("API: no more products.")
+                    if set_progress:
+                        set_progress(1.0)
                     return out
 
                 out.extend(batch)
-                if count_cb:
-                    count_cb(len(out))
+                if set_count:
+                    set_count(len(out))
 
                 if len(batch) < per_page:
-                    if log_cb:
-                        log_cb(f"API: completed ({len(out)} products).")
-                    if progress_cb:
-                        progress_cb(1.0)
+                    if append_log:
+                        append_log(f"API: completed ({len(out)} products).")
+                    if set_progress:
+                        set_progress(1.0)
                     return out
 
                 page += 1
@@ -414,7 +399,6 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
                 "API fetch failed due to repeated SSL/connection errors while paging products.\n"
                 f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
             )
-
 
 def wc_to_product(p: dict) -> dict:
     cats = []
@@ -456,43 +440,48 @@ def wc_to_product(p: dict) -> dict:
         "_image_path": None,
     }
 
-
-def get_products_from_api_or_cache_live(wc_url, wc_ck, wc_cs, *, timeout=30, force_refresh=False, log_cb=None, progress_cb=None, count_cb=None):
+def get_products_from_api_or_cache(
+    wc_url: str,
+    wc_ck: str,
+    wc_cs: str,
+    *,
+    timeout: int,
+    force_refresh: bool,
+    append_log=None,
+    set_progress=None,
+    set_count=None,
+):
     if not force_refresh:
         cached_raw, fetched_at = api_cache_load()
         if cached_raw is not None:
-            if log_cb:
-                log_cb(f"Loaded {len(cached_raw)} products from cache ({fetched_at}).")
-            if progress_cb:
-                progress_cb(1.0)
-            normalized = [wc_to_product(p) for p in cached_raw]
-            return normalized, fetched_at, "disk_cache"
+            if append_log:
+                append_log(f"Loaded {len(cached_raw)} products from cache ({fetched_at}).")
+            if set_progress:
+                set_progress(1.0)
+            return [wc_to_product(x) for x in cached_raw], fetched_at, "disk_cache"
 
     raw = wc_fetch_products(
         wc_url, wc_ck, wc_cs,
         per_page=25,
         timeout=timeout,
-        log_cb=log_cb,
-        progress_cb=progress_cb,
-        count_cb=count_cb,
+        append_log=append_log,
+        set_progress=set_progress,
+        set_count=set_count,
     )
     api_cache_save(raw)
     fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    normalized = [wc_to_product(p) for p in raw]
-    return normalized, fetched_at, "api"
+    return [wc_to_product(x) for x in raw], fetched_at, "api"
 
-
-# =========================
-# CSV (backup)
-# =========================
-def read_csv_bytes(uploaded_file) -> list[dict]:
-    content = uploaded_file.getvalue()
+# ----------------------------
+# CSV backup loader
+# ----------------------------
+def read_csv_rows(uploaded_file) -> list[dict]:
+    b = uploaded_file.getvalue()
     try:
-        text = content.decode("utf-8")
+        text = b.decode("utf-8")
     except Exception:
-        text = content.decode("latin-1", errors="replace")
+        text = b.decode("latin-1", errors="replace")
     return list(csv.DictReader(io.StringIO(text)))
-
 
 def best_key(keys: list[str], candidates: list[str]) -> str | None:
     lower = {k.lower(): k for k in keys}
@@ -501,14 +490,12 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
             return lower[c.lower()]
     return None
 
-
-# =========================
-# PDF
-# =========================
+# ----------------------------
+# PDF generation
+# ----------------------------
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
-
 
 class CatalogPDF(FPDF):
     def __init__(self, title: str, logo_path: str, brand_site: str, disclaimer: str, *args, **kwargs):
@@ -534,12 +521,12 @@ class CatalogPDF(FPDF):
         self.set_text_color(*self.blue)
         self.set_font("Helvetica", "B", 13)
         self.set_xy(title_x, top + 1)
-        self.cell(0, 8, pdf_safe(self.catalog_title), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        self.cell(0, 8, self.catalog_title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         self.set_text_color(0, 0, 0)
         self.set_font("Helvetica", "", 9)
         self.set_xy(-12 - 25, top + 2)
-        self.cell(25, 8, pdf_safe(f"Page {self.page_no()}"), align="R")
+        self.cell(25, 8, f"Page {self.page_no()}", align="R")
 
         self.set_draw_color(*self.blue)
         self.set_line_width(0.6)
@@ -553,10 +540,21 @@ class CatalogPDF(FPDF):
         self.set_text_color(55, 65, 81)
         self.set_font("Helvetica", "", 8)
         self.set_xy(12, y + 2)
-        self.cell(0, 8, pdf_safe(f"{self.brand_site} | {self.disclaimer}"))
+        self.cell(0, 8, f"{self.brand_site} | {self.disclaimer}")
 
-
-def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symbol, show_price, show_sku, show_desc, show_attrs, exclude_oos) -> bytes:
+def make_catalog_pdf_bytes(
+    products: list[dict],
+    *,
+    title: str,
+    page_size: str,
+    columns: int,
+    currency_symbol: str,
+    show_price: bool,
+    show_sku: bool,
+    show_desc: bool,
+    show_attrs: bool,
+    exclude_oos: bool,
+) -> bytes:
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
 
@@ -580,7 +578,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
     usable_w = pdf.w - 2 * margin
     card_w = (usable_w - (columns - 1) * gutter) / columns
 
-    rows = 3  # 3x3 max when columns=3
+    rows = 3  # 3x3 target
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
@@ -665,6 +663,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                     pdf.set_line_width(0.5)
                     pdf.rect(xx, yy, card_w, card_h, style="D")
 
+                    # Clickable card
                     url = safe_text(p.get("url"))
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
@@ -690,6 +689,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                     max_w = card_w - 2 * pad
                     line_y = img_y + img_h + 2
 
+                    # Name
                     pdf.set_text_color(0, 0, 0)
                     pdf.set_font("Helvetica", "B", 9.5)
                     name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
@@ -697,6 +697,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                     pdf.cell(max_w, 4.5, name)
                     line_y += 5.2
 
+                    # Price
                     if show_price:
                         reg = p.get("regular_price")
                         sale = p.get("sale_price")
@@ -728,6 +729,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                                 line_y += 6
                         pdf.set_text_color(0, 0, 0)
 
+                    # SKU
                     if show_sku:
                         sku = safe_text(p.get("sku"))
                         if sku:
@@ -737,6 +739,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
+                    # Attributes (2 lines)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -756,6 +759,7 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
                                 line_y += 4.0
                                 shown += 1
 
+                    # Description (2 lines)
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -769,17 +773,16 @@ def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symb
 
                     xx += card_w + gutter
 
-    # OUTPUT — strict bytes ONLY
-    out = pdf.output()          # may be bytes/bytearray/str depending on env
-    out_b = strict_bytes(out)   # force bytes
-    return out_b
+    # Output -> STRICT bytes
+    out = pdf.output()
+    return strict_bytes(out)
 
-
-# =========================
+# ============================================================
 # UI
-# =========================
+# ============================================================
 login_gate()
 
+# session defaults
 if "step" not in st.session_state:
     st.session_state.step = 1
 if "products_raw" not in st.session_state:
@@ -790,15 +793,16 @@ if "_settings" not in st.session_state:
     st.session_state._settings = {}
 
 with st.sidebar:
+    st.caption(f"App version: **{APP_VERSION}**")
     try:
         st.image(LOGO_PNG_PATH, width=190)
     except Exception:
-        st.caption("Logo missing: upload Bkosher.png to repo root.")
+        st.warning("Logo missing. Upload Bkosher.png to repo root.")
 
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured")
     else:
-        st.warning("Woo API secrets missing (WC_URL / WC_CK / WC_CS)")
+        st.error("Woo API secrets missing (WC_URL / WC_CK / WC_CS)")
 
     cached_raw, cached_at = api_cache_load()
     if cached_raw is not None:
@@ -808,14 +812,16 @@ with st.sidebar:
         st.session_state.authenticated = False
         st.rerun()
 
-    if st.button("Reset"):
+    if st.button("Reset app state"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
 
 st.title("Customer Catalog Builder")
 st.caption("Default = WooCommerce API. CSV upload is a backup option.")
+st.markdown("<div class='bk_hint'>You should always see progress + live logs while importing/downloading.</div>", unsafe_allow_html=True)
 
+# Step 1
 st.subheader("Step 1 — Choose data source")
 data_source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
 
@@ -823,15 +829,62 @@ if st.button("Continue → Load products"):
     st.session_state.step = 2
     st.rerun()
 
+# Step 2
 if st.session_state.step >= 2:
     st.subheader("Step 2 — Load products")
-    st.markdown("<div class='bk_hint'>You will see a progress bar + live log while importing.</div>", unsafe_allow_html=True)
 
-    if data_source == "CSV Upload":
+    if data_source == "WooCommerce API":
+        api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
+        c1, c2 = st.columns(2)
+        load_cached = c1.button("Load (use cache if available)")
+        refresh = c2.button("Refresh cache (fetch again)")
+
+        if load_cached or refresh:
+            prog = st.progress(0.0)
+            status = st.empty()
+            count_box = st.empty()
+            log_box = st.empty()
+            logs = []
+
+            def append_log(msg: str):
+                logs.append(msg)
+                log_box.markdown(
+                    "<div class='bk_log'>" + html.escape("\n".join(logs[-30:])) + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            def set_progress(v: float):
+                prog.progress(max(0.0, min(1.0, float(v))))
+
+            def set_count(n: int):
+                count_box.info(f"Products loaded so far: {n:,}")
+
+            try:
+                status.info("Fetching products from API…")
+                products, fetched_at, source = get_products_from_api_or_cache(
+                    WC_URL, WC_CK, WC_CS,
+                    timeout=int(api_timeout),
+                    force_refresh=bool(refresh),
+                    append_log=append_log,
+                    set_progress=set_progress,
+                    set_count=set_count,
+                )
+                status.success("Products loaded.")
+                set_progress(1.0)
+
+                st.session_state.products_raw = products
+                st.session_state.step = 3
+                st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
+
+    else:
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
         csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"])
         if st.button("Load from CSV", disabled=(csv_file is None)):
-            rows = read_csv_bytes(csv_file)
+            rows = read_csv_rows(csv_file)
             if not rows:
                 st.error("CSV empty.")
                 st.stop()
@@ -918,49 +971,7 @@ if st.session_state.step >= 2:
             st.success(f"Loaded {len(products):,} products from CSV.")
             st.rerun()
 
-    else:
-        api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
-        col1, col2 = st.columns(2)
-        load_cached = col1.button("Load (use cache if available)")
-        refresh = col2.button("Refresh cache (fetch again)")
-
-        if load_cached or refresh:
-            prog = st.progress(0.0)
-            status = st.empty()
-            count_box = st.empty()
-            log_box = st.empty()
-            logs = []
-
-            def log(msg: str):
-                logs.append(msg)
-                log_box.markdown("<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-25:])) + "</div>", unsafe_allow_html=True)
-
-            def set_progress(v: float):
-                prog.progress(max(0.0, min(1.0, float(v))))
-
-            def set_count(n: int):
-                count_box.info(f"Products loaded so far: {n:,}")
-
-            try:
-                status.info("Fetching products from API…")
-                products, fetched_at, source = get_products_from_api_or_cache_live(
-                    WC_URL, WC_CK, WC_CS,
-                    timeout=api_timeout,
-                    force_refresh=bool(refresh),
-                    log_cb=log,
-                    progress_cb=set_progress,
-                    count_cb=set_count,
-                )
-                status.success("Done.")
-                set_progress(1.0)
-                st.session_state.products_raw = products
-                st.session_state.step = 3
-                st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
-                st.rerun()
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
-
+# Step 3
 if st.session_state.step >= 3:
     st.subheader("Step 3 — Filter & layout")
     products = st.session_state.products_raw
@@ -1011,6 +1022,7 @@ if st.session_state.step >= 3:
         }
         st.rerun()
 
+# Step 4
 if st.session_state.step >= 4:
     st.subheader("Step 4 — Generate & download")
     filtered = st.session_state.products_filtered
@@ -1030,9 +1042,9 @@ if st.session_state.step >= 4:
     logs = []
     t0 = time.time()
 
-    def log(msg: str):
+    def append_log(msg: str):
         logs.append(f"[{time.time()-t0:6.1f}s] {msg}")
-        log_box.markdown("<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-28:])) + "</div>", unsafe_allow_html=True)
+        log_box.markdown("<div class='bk_log'>" + html.escape("\n".join(logs[-30:])) + "</div>", unsafe_allow_html=True)
 
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
@@ -1040,7 +1052,7 @@ if st.session_state.step >= 4:
     ok = 0
 
     status.info("Stage 1/2 — Downloading images…")
-    log(f"Preset={preset} workers={dl_workers} retries={dl_retries}")
+    append_log(f"Preset={preset} workers={dl_workers} retries={dl_retries}")
 
     def dl_task(p: dict):
         b = download_with_retries(
@@ -1048,7 +1060,7 @@ if st.session_state.step >= 4:
             timeout=dl_timeout,
             retries=dl_retries,
             backoff=dl_backoff,
-            log_cb=log,
+            append_log=append_log,
         )
         return p, b
 
@@ -1062,7 +1074,7 @@ if st.session_state.step >= 4:
             done += 1
             progress.progress(min(0.75, (done / total) * 0.75))
             if done % 50 == 0 or done == total:
-                log(f"Images: {done}/{total} ok={ok} missing={done-ok}")
+                append_log(f"Images: {done}/{total} ok={ok} missing={done-ok}")
 
     status.info("Stage 2/2 — Building PDF…")
     progress.progress(0.85)
@@ -1080,15 +1092,16 @@ if st.session_state.step >= 4:
         exclude_oos=bool(settings.get("exclude_oos", True)),
     )
 
-    # FINAL GUARANTEE: bytes only (not bytearray, not BytesIO)
+    # FINAL SAFETY: ensure bytes only
     pdf_bytes = strict_bytes(pdf_bytes)
 
     progress.progress(1.0)
     status.success("PDF ready.")
 
+    # THE ONLY download button in the app (bytes only)
     st.download_button(
         "Download PDF",
-        data=pdf_bytes,  # <- THIS IS BYTES ONLY
+        data=pdf_bytes,
         file_name="bkosher_catalog.pdf",
         mime="application/pdf",
     )
