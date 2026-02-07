@@ -1123,9 +1123,17 @@ if isinstance(pdf_bytes, str):
 elif not isinstance(pdf_bytes, (bytes, bytearray)):
     pdf_bytes = bytes(pdf_bytes)
 
+# ---- Force correct type for Streamlit download_button ----
+if isinstance(pdf_bytes, str):
+    pdf_bytes = pdf_bytes.encode("latin-1", "ignore")
+elif isinstance(pdf_bytes, bytearray):
+    pdf_bytes = bytes(pdf_bytes)
+elif not isinstance(pdf_bytes, (bytes, io.BytesIO)):
+    pdf_bytes = bytes(pdf_bytes)
+
 st.download_button(
     "Download PDF",
     data=pdf_bytes,
     file_name="bkosher_catalog.pdf",
     mime="application/pdf",
-    st.caption("If links don’t work in your viewer, test in Chrome/Edge or Adobe Acrobat Reader.")
+)
