@@ -1,10 +1,5 @@
 # app.py — B-Kosher Catalog Builder (Streamlit Cloud hardened)
-# - API default + CSV option
-# - Filters, attributes, sale pricing, clickable cards, 3x3 on A4
-# - Progress + log
-# - Disk cache for API + images
-# - BRANDING
-# - HARDENED: download_button always receives a file-like returning BYTES (never bytearray)
+# Key fix: st.download_button ALWAYS receives `bytes` (never bytearray / file-like)
 
 import io
 import re
@@ -27,9 +22,9 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 
-# =========================================================
+# =========================
 # BRAND / CONFIG
-# =========================================================
+# =========================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
 BRAND_RED_HEX = "#C8102E"
@@ -39,8 +34,7 @@ DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-# Put your logo in repo root with this exact name:
-LOGO_PNG_PATH = "Bkosher.png"
+LOGO_PNG_PATH = "Bkosher.png"  # make sure this exists in your repo root
 
 st.markdown(
     """
@@ -76,9 +70,9 @@ st.markdown(
 )
 
 
-# =========================================================
+# =========================
 # SECRETS + LOGIN
-# =========================================================
+# =========================
 def get_secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, default)
@@ -114,11 +108,11 @@ def login_gate():
     st.stop()
 
 
-# =========================================================
-# STREAMLIT DOWNLOAD HARDENING (NO BYTEARRAY EVER)
-# =========================================================
-def to_bytes(x) -> bytes:
-    """Convert any reasonable binary/string output into strict bytes."""
+# =========================
+# HARD FIX: ONLY BYTES
+# =========================
+def strict_bytes(x) -> bytes:
+    """Convert anything we might get into true bytes. Never returns bytearray."""
     if x is None:
         return b""
     if isinstance(x, bytes):
@@ -126,28 +120,13 @@ def to_bytes(x) -> bytes:
     if isinstance(x, bytearray):
         return bytes(x)
     if isinstance(x, str):
-        # PDFs from latin-1 core fonts: safest for PyFPDF/FPDF outputs
         return x.encode("latin-1", "ignore")
-    # last resort
     return bytes(x)
 
 
-class BytesReader(io.BytesIO):
-    """Guarantee .read() returns bytes (Streamlit rejects bytearray)."""
-    def read(self, *args, **kwargs):
-        return bytes(super().read(*args, **kwargs))
-
-
-def downloadable_pdf_buffer(pdf_bytes_like) -> BytesReader:
-    b = to_bytes(pdf_bytes_like)
-    bio = BytesReader(b)
-    bio.seek(0)
-    return bio
-
-
-# =========================================================
-# TEXT HELPERS (no nan, &amp; -> &, pdf-safe latin-1)
-# =========================================================
+# =========================
+# TEXT HELPERS
+# =========================
 def pdf_safe(s: str) -> str:
     if s is None:
         return ""
@@ -205,7 +184,6 @@ def fmt_money(symbol: str, v: float | None) -> str:
 
 
 def sanitize_url(u: str) -> str:
-    """Strip keys from any URL we might display."""
     try:
         parts = urlsplit(u)
         q = parse_qsl(parts.query, keep_blank_values=True)
@@ -257,9 +235,9 @@ def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
     return lines
 
 
-# =========================================================
+# =========================
 # DISK CACHE (API + IMAGES)
-# =========================================================
+# =========================
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
 
@@ -358,20 +336,10 @@ def api_cache_save(products_raw: list[dict]):
         pass
 
 
-# =========================================================
-# WOO API FETCH (with progress/log)
-# =========================================================
-def wc_fetch_products(
-    base_url: str,
-    ck: str,
-    cs: str,
-    *,
-    per_page: int = 25,
-    timeout: int = 30,
-    log_cb=None,
-    progress_cb=None,
-    count_cb=None,
-):
+# =========================
+# WOO API
+# =========================
+def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=30, log_cb=None, progress_cb=None, count_cb=None):
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
@@ -489,17 +457,7 @@ def wc_to_product(p: dict) -> dict:
     }
 
 
-def get_products_from_api_or_cache_live(
-    wc_url: str,
-    wc_ck: str,
-    wc_cs: str,
-    *,
-    timeout: int = 30,
-    force_refresh: bool = False,
-    log_cb=None,
-    progress_cb=None,
-    count_cb=None,
-):
+def get_products_from_api_or_cache_live(wc_url, wc_ck, wc_cs, *, timeout=30, force_refresh=False, log_cb=None, progress_cb=None, count_cb=None):
     if not force_refresh:
         cached_raw, fetched_at = api_cache_load()
         if cached_raw is not None:
@@ -524,9 +482,9 @@ def get_products_from_api_or_cache_live(
     return normalized, fetched_at, "api"
 
 
-# =========================================================
-# CSV LOADER (backup mode)
-# =========================================================
+# =========================
+# CSV (backup)
+# =========================
 def read_csv_bytes(uploaded_file) -> list[dict]:
     content = uploaded_file.getvalue()
     try:
@@ -544,9 +502,9 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
     return None
 
 
-# =========================================================
+# =========================
 # PDF
-# =========================================================
+# =========================
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
@@ -598,19 +556,7 @@ class CatalogPDF(FPDF):
         self.cell(0, 8, pdf_safe(f"{self.brand_site} | {self.disclaimer}"))
 
 
-def make_catalog_pdf_bytes(
-    products: list[dict],
-    *,
-    title: str,
-    page_size: str,
-    columns: int,
-    currency_symbol: str,
-    show_price: bool,
-    show_sku: bool,
-    show_desc: bool,
-    show_attrs: bool,
-    exclude_oos: bool,
-) -> bytes:
+def make_catalog_pdf_bytes(products, *, title, page_size, columns, currency_symbol, show_price, show_sku, show_desc, show_attrs, exclude_oos) -> bytes:
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
 
@@ -634,20 +580,17 @@ def make_catalog_pdf_bytes(
     usable_w = pdf.w - 2 * margin
     card_w = (usable_w - (columns - 1) * gutter) / columns
 
-    rows = 3  # fixed: 3 rows so 3x3 fits when columns=3
+    rows = 3  # 3x3 max when columns=3
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
-    def grouped_products():
-        grouped = {}
-        for p in products:
-            if exclude_oos and not is_in_stock(p):
-                continue
-            grouped.setdefault(primary_category(p), []).append(p)
-        cats = sorted(grouped.keys(), key=lambda s: s.lower())
-        return cats, grouped
+    grouped = {}
+    for p in products:
+        if exclude_oos and not is_in_stock(p):
+            continue
+        grouped.setdefault(primary_category(p), []).append(p)
 
-    cats, grouped = grouped_products()
+    cats = sorted(grouped.keys(), key=lambda s: s.lower())
     blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
     red_rgb = hex_to_rgb(BRAND_RED_HEX)
 
@@ -718,17 +661,14 @@ def make_catalog_pdf_bytes(
                     p = items[idx]
                     idx += 1
 
-                    # Card border
                     pdf.set_draw_color(*blue_rgb)
                     pdf.set_line_width(0.5)
                     pdf.rect(xx, yy, card_w, card_h, style="D")
 
-                    # Clickable card
                     url = safe_text(p.get("url"))
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
 
-                    # Image
                     pad = 3.5
                     img_h = card_h * 0.48
                     img_w = card_w - 2 * pad
@@ -746,12 +686,10 @@ def make_catalog_pdf_bytes(
                         pdf.set_xy(xx, img_y + img_h / 2 - 2)
                         pdf.cell(card_w, 4, "No image", align="C")
 
-                    # Text block
                     tx = xx + pad
                     max_w = card_w - 2 * pad
                     line_y = img_y + img_h + 2
 
-                    # Name
                     pdf.set_text_color(0, 0, 0)
                     pdf.set_font("Helvetica", "B", 9.5)
                     name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
@@ -759,7 +697,6 @@ def make_catalog_pdf_bytes(
                     pdf.cell(max_w, 4.5, name)
                     line_y += 5.2
 
-                    # Price / sale
                     if show_price:
                         reg = p.get("regular_price")
                         sale = p.get("sale_price")
@@ -791,7 +728,6 @@ def make_catalog_pdf_bytes(
                                 line_y += 6
                         pdf.set_text_color(0, 0, 0)
 
-                    # SKU
                     if show_sku:
                         sku = safe_text(p.get("sku"))
                         if sku:
@@ -801,7 +737,6 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
                             line_y += 4.5
 
-                    # Attributes (2 lines max)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -821,7 +756,6 @@ def make_catalog_pdf_bytes(
                                 line_y += 4.0
                                 shown += 1
 
-                    # Description (2 lines max)
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -835,15 +769,15 @@ def make_catalog_pdf_bytes(
 
                     xx += card_w + gutter
 
-    # IMPORTANT:
-    # fpdf2: pdf.output() returns bytes in modern versions, but we normalize anyway.
-    out = pdf.output()
-    return to_bytes(out)
+    # OUTPUT — strict bytes ONLY
+    out = pdf.output()          # may be bytes/bytearray/str depending on env
+    out_b = strict_bytes(out)   # force bytes
+    return out_b
 
 
-# =========================================================
-# UI STARTS HERE
-# =========================================================
+# =========================
+# UI
+# =========================
 login_gate()
 
 if "step" not in st.session_state:
@@ -880,16 +814,15 @@ with st.sidebar:
         st.rerun()
 
 st.title("Customer Catalog Builder")
-st.caption("Default = WooCommerce API. CSV is available as a backup.")
+st.caption("Default = WooCommerce API. CSV upload is a backup option.")
 
-# Step 1
 st.subheader("Step 1 — Choose data source")
 data_source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
+
 if st.button("Continue → Load products"):
     st.session_state.step = 2
     st.rerun()
 
-# Step 2
 if st.session_state.step >= 2:
     st.subheader("Step 2 — Load products")
     st.markdown("<div class='bk_hint'>You will see a progress bar + live log while importing.</div>", unsafe_allow_html=True)
@@ -1000,10 +933,7 @@ if st.session_state.step >= 2:
 
             def log(msg: str):
                 logs.append(msg)
-                log_box.markdown(
-                    "<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-25:])) + "</div>",
-                    unsafe_allow_html=True
-                )
+                log_box.markdown("<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-25:])) + "</div>", unsafe_allow_html=True)
 
             def set_progress(v: float):
                 prog.progress(max(0.0, min(1.0, float(v))))
@@ -1031,7 +961,6 @@ if st.session_state.step >= 2:
                 st.error(str(e))
                 st.stop()
 
-# Step 3
 if st.session_state.step >= 3:
     st.subheader("Step 3 — Filter & layout")
     products = st.session_state.products_raw
@@ -1057,10 +986,7 @@ if st.session_state.step >= 3:
         sset = set(selected_cats)
         filtered = [p for p in filtered if set(p.get("categories") or []).intersection(sset)]
     if q:
-        filtered = [
-            p for p in filtered
-            if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())
-        ]
+        filtered = [p for p in filtered if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())]
     if exclude_oos:
         filtered = [p for p in filtered if is_in_stock(p)]
 
@@ -1085,7 +1011,6 @@ if st.session_state.step >= 3:
         }
         st.rerun()
 
-# Step 4
 if st.session_state.step >= 4:
     st.subheader("Step 4 — Generate & download")
     filtered = st.session_state.products_filtered
@@ -1107,10 +1032,7 @@ if st.session_state.step >= 4:
 
     def log(msg: str):
         logs.append(f"[{time.time()-t0:6.1f}s] {msg}")
-        log_box.markdown(
-            "<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-28:])) + "</div>",
-            unsafe_allow_html=True
-        )
+        log_box.markdown("<div class='bk_log'>" + htmlmod.escape("\n".join(logs[-28:])) + "</div>", unsafe_allow_html=True)
 
     items = [p for p in filtered if p.get("_img_url")]
     total = max(1, len(items))
@@ -1158,16 +1080,15 @@ if st.session_state.step >= 4:
         exclude_oos=bool(settings.get("exclude_oos", True)),
     )
 
-    # ABSOLUTE HARDENING: Streamlit receives a file-like that reads BYTES.
-    pdf_file = downloadable_pdf_buffer(pdf_bytes)
+    # FINAL GUARANTEE: bytes only (not bytearray, not BytesIO)
+    pdf_bytes = strict_bytes(pdf_bytes)
 
     progress.progress(1.0)
     status.success("PDF ready.")
 
     st.download_button(
         "Download PDF",
-        data=pdf_file,
+        data=pdf_bytes,  # <- THIS IS BYTES ONLY
         file_name="bkosher_catalog.pdf",
         mime="application/pdf",
     )
-    st.caption("If links don’t work in your viewer, test in Chrome/Edge or Adobe Acrobat Reader.")
