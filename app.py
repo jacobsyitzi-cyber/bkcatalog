@@ -1,8 +1,20 @@
 # app.py — B-Kosher Catalog Builder (Streamlit Cloud SAFE build)
-# Key guarantees:
+# Build: adds
+# - Default grid "Standard" (Portrait 3x3), option "Compact" (Portrait 6x6)
+# - Orientation selector (Portrait / Landscape) with auto-friendly grids for landscape
+# - Category tree selector (Parent > Child > Grandchild paths)
+# - Sort & group by full category path (parent/child/grandchild)
+# - Brand category divider bars
+# - Sale badge + dual pricing (forced 2dp everywhere)
+# - Image fallback order (try image #1, #2, #3…)
+# - Defaults: SKU unticked, Description unticked
+# - Presets: Standard, Compact, Sale-only
+# - NEW: option to include private/unpublished products (status=any)
+#
+# HARD GUARANTEES:
 # 1) Only ONE st.download_button exists (PDF download)
-# 2) The data passed to st.download_button is ALWAYS bytes (never bytearray)
-# 3) No function is named "log" to avoid accidental collisions/overwrites
+# 2) data passed to st.download_button is ALWAYS bytes (never bytearray)
+# 3) No function is named "log" (avoids collisions/overwrites)
 
 import io
 import re
@@ -14,6 +26,7 @@ import html
 import hashlib
 import datetime
 from pathlib import Path
+from typing import Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
@@ -24,14 +37,14 @@ from PIL import Image
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
-# ----------------------------
-# VERSION (visible in UI)
-# ----------------------------
-APP_VERSION = "2026-02-07-v3"
+# ============================
+# VERSION
+# ============================
+APP_VERSION = "2026-02-07-v5"
 
-# ----------------------------
+# ============================
 # BRANDING
-# ----------------------------
+# ============================
 BRAND_RED_HEX = "#C8102E"
 BRAND_BLUE_HEX = "#004C97"
 DEFAULT_TITLE = "B-Kosher Product Catalog"
@@ -78,23 +91,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# ----------------------------
-# Secrets helpers
-# ----------------------------
+# ============================
+# SECRETS
+# ============================
 def get_secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, default)
     except Exception:
         return default
 
+
 APP_PASSWORD = get_secret("APP_PASSWORD", "")
 WC_URL = get_secret("WC_URL", "")
 WC_CK = get_secret("WC_CK", "")
 WC_CS = get_secret("WC_CS", "")
 
-# ----------------------------
-# Login gate
-# ----------------------------
+# ============================
+# LOGIN
+# ============================
 def login_gate():
     if not APP_PASSWORD:
         st.error("APP_PASSWORD is not set in Streamlit secrets.")
@@ -115,9 +129,10 @@ def login_gate():
         st.error("Incorrect password.")
     st.stop()
 
-# ----------------------------
-# Strict bytes conversion (THE FIX)
-# ----------------------------
+
+# ============================
+# BYTE SAFETY (THE FIX)
+# ============================
 def strict_bytes(x) -> bytes:
     if x is None:
         return b""
@@ -129,9 +144,10 @@ def strict_bytes(x) -> bytes:
         return x.encode("latin-1", "ignore")
     return bytes(x)
 
-# ----------------------------
-# Text cleanup helpers
-# ----------------------------
+
+# ============================
+# TEXT HELPERS
+# ============================
 def pdf_safe(s: str) -> str:
     if s is None:
         return ""
@@ -152,6 +168,7 @@ def pdf_safe(s: str) -> str:
     except Exception:
         return s.encode("latin-1", "ignore").decode("latin-1")
 
+
 def safe_text(v) -> str:
     if v is None:
         return ""
@@ -160,6 +177,7 @@ def safe_text(v) -> str:
         return ""
     return pdf_safe(s)
 
+
 def strip_html(s: str) -> str:
     s = safe_text(s)
     if not s:
@@ -167,6 +185,7 @@ def strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def parse_money(v) -> float | None:
     s = safe_text(v)
@@ -178,10 +197,13 @@ def parse_money(v) -> float | None:
     except Exception:
         return None
 
+
 def fmt_money(symbol: str, v: float | None) -> str:
+    # FORCE: always 2 decimals
     if v is None:
         return ""
     return f"{symbol}{v:.2f}"
+
 
 def sanitize_url(u: str) -> str:
     try:
@@ -193,14 +215,6 @@ def sanitize_url(u: str) -> str:
     except Exception:
         return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
 
-def primary_category(p: dict) -> str:
-    cats = p.get("categories") or []
-    if isinstance(cats, list) and cats:
-        return safe_text(cats[0]) or "Other"
-    return "Other"
-
-def is_in_stock(p: dict) -> bool:
-    return safe_text(p.get("stock_status")).lower() != "outofstock"
 
 def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
     t = pdf_safe(text)
@@ -210,6 +224,7 @@ def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
     while t and pdf.get_string_width(t + ell) > max_w:
         t = t[:-1]
     return (t + ell) if t else ell
+
 
 def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
     text = pdf_safe(text)
@@ -229,18 +244,25 @@ def wrap_two_lines(pdf: FPDF, text: str, max_w: float) -> list[str]:
         out.append(line)
     return out
 
-# ----------------------------
-# Cache dirs
-# ----------------------------
+
+# ============================
+# CACHE
+# ============================
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
+
 API_CACHE_DIR = Path("./api_cache")
 API_CACHE_DIR.mkdir(exist_ok=True)
-API_CACHE_FILE = API_CACHE_DIR / "products.json"
+
+API_PRODUCTS_PUBLISH = API_CACHE_DIR / "products_publish.json"
+API_PRODUCTS_ANY = API_CACHE_DIR / "products_any.json"
+API_CATEGORIES_CACHE = API_CACHE_DIR / "categories.json"
+
 
 def cache_path_for_url(url: str) -> Path:
     h = hashlib.sha1(url.encode("utf-8")).hexdigest()
     return IMAGE_CACHE_DIR / f"{h}.jpg"
+
 
 def read_image_cache(url: str) -> bytes | None:
     p = cache_path_for_url(url)
@@ -251,11 +273,13 @@ def read_image_cache(url: str) -> bytes | None:
             return None
     return None
 
+
 def write_image_cache(url: str, b: bytes):
     try:
         cache_path_for_url(url).write_bytes(b)
     except Exception:
         pass
+
 
 def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> bytes | None:
     try:
@@ -270,7 +294,15 @@ def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82) -> by
     except Exception:
         return None
 
-def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float, append_log=None) -> bytes | None:
+
+def download_with_retries(
+    url: str,
+    *,
+    timeout: int,
+    retries: int,
+    backoff: float,
+    append_log=None,
+) -> bytes | None:
     if not url or not url.startswith("http"):
         return None
 
@@ -298,33 +330,47 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             continue
     return None
 
-def api_cache_load():
-    if not API_CACHE_FILE.exists():
+
+def api_cache_load(path: Path):
+    if not path.exists():
         return None, None
     try:
-        payload = json.loads(API_CACHE_FILE.read_text(encoding="utf-8"))
-        products = payload.get("products")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        data = payload.get("data")
         fetched_at = payload.get("fetched_at", "")
-        if isinstance(products, list):
-            return products, fetched_at
+        if isinstance(data, list):
+            return data, fetched_at
     except Exception:
         pass
     return None, None
 
-def api_cache_save(products_raw: list[dict]):
+
+def api_cache_save(path: Path, data_list: list[dict]):
     payload = {
         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "products": products_raw,
+        "data": data_list,
     }
     try:
-        API_CACHE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+        path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
 
-# ----------------------------
-# Woo API fetch
-# ----------------------------
-def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=30, append_log=None, set_progress=None, set_count=None):
+
+# ============================
+# WOO API
+# ============================
+def wc_fetch_products(
+    base_url: str,
+    ck: str,
+    cs: str,
+    *,
+    include_unpublished: bool,
+    per_page=25,
+    timeout=30,
+    append_log=None,
+    set_progress=None,
+    set_count=None,
+):
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
@@ -333,21 +379,23 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
     session = requests.Session()
 
     page = 1
-    out = []
+    out: list[dict] = []
     retries = 8
+
+    status_value = "any" if include_unpublished else "publish"
 
     while True:
         if append_log:
-            append_log(f"API: fetching page {page}…")
+            append_log(f"API: fetching products page {page} (status={status_value})…")
         if set_progress:
-            set_progress(min(0.90, 0.03 + page * 0.01))
+            set_progress(min(0.88, 0.03 + page * 0.01))
 
         params = {
             "consumer_key": ck,
             "consumer_secret": cs,
             "per_page": per_page,
             "page": page,
-            "status": "publish",
+            "status": status_value,
         }
 
         last_exc = None
@@ -379,7 +427,7 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
 
                 if len(batch) < per_page:
                     if append_log:
-                        append_log(f"API: completed ({len(out)} products).")
+                        append_log(f"API: products completed ({len(out)}).")
                     if set_progress:
                         set_progress(1.0)
                     return out
@@ -400,14 +448,142 @@ def wc_fetch_products(base_url: str, ck: str, cs: str, *, per_page=25, timeout=3
                 f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
             )
 
-def wc_to_product(p: dict) -> dict:
-    cats = []
+
+def wc_fetch_categories(
+    base_url: str,
+    ck: str,
+    cs: str,
+    *,
+    timeout=30,
+    append_log=None,
+    set_progress=None,
+):
+    base_url = base_url.rstrip("/")
+    session = requests.Session()
+
+    endpoint = f"{base_url}/wp-json/wc/v3/products/categories"
+    per_page = 100
+    page = 1
+    out: list[dict] = []
+    retries = 6
+
+    while True:
+        if append_log:
+            append_log(f"API: fetching categories page {page}…")
+        if set_progress:
+            set_progress(min(0.92, 0.35 + page * 0.02))
+
+        params = {
+            "consumer_key": ck,
+            "consumer_secret": cs,
+            "per_page": per_page,
+            "page": page,
+            "hide_empty": "false",
+        }
+
+        last_exc = None
+        for attempt in range(retries + 1):
+            if attempt > 0:
+                time.sleep(min(0.7 * (2 ** (attempt - 1)), 10.0))
+            try:
+                r = session.get(endpoint, params=params, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
+                if r.status_code in (401, 403):
+                    # categories not vital; just stop
+                    return out
+                if r.status_code >= 400:
+                    return out
+
+                batch = r.json()
+                if not batch:
+                    return out
+
+                out.extend(batch)
+                if len(batch) < per_page:
+                    return out
+                page += 1
+                last_exc = None
+                break
+
+            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                last_exc = e
+                continue
+
+        if last_exc is not None:
+            return out
+
+
+def build_category_paths(categories: list[dict]) -> dict[int, list[str]]:
+    by_id: dict[int, dict] = {}
+    for c in categories:
+        try:
+            cid = int(c.get("id"))
+        except Exception:
+            continue
+        by_id[cid] = {
+            "id": cid,
+            "name": safe_text(c.get("name")),
+            "parent": int(c.get("parent") or 0),
+        }
+
+    paths: dict[int, list[str]] = {}
+
+    def resolve(cid: int, depth=0) -> list[str]:
+        if cid in paths:
+            return paths[cid]
+        if depth > 10:
+            return []
+        node = by_id.get(cid)
+        if not node:
+            return []
+        name = node["name"] or ""
+        parent = node["parent"]
+        if parent and parent in by_id:
+            ppath = resolve(parent, depth + 1)
+            out = [x for x in ppath if x] + ([name] if name else [])
+        else:
+            out = [name] if name else []
+        paths[cid] = out
+        return out
+
+    for cid in list(by_id.keys()):
+        resolve(cid)
+
+    return paths
+
+
+def category_path_to_str(path: list[str]) -> str:
+    return " > ".join([p for p in path if p])
+
+
+# ============================
+# NORMALIZE PRODUCT
+# ============================
+def wc_to_product(p: dict, cat_paths: dict[int, list[str]]) -> dict:
+    # Category IDs & names from API
+    cat_ids: list[int] = []
+    cat_names: list[str] = []
     for c in (p.get("categories") or []):
+        try:
+            cid = int(c.get("id"))
+            cat_ids.append(cid)
+        except Exception:
+            pass
         n = safe_text(c.get("name"))
         if n:
-            cats.append(n)
+            cat_names.append(n)
 
-    attrs = []
+    # Compute best category path: choose the DEEPEST path among categories
+    best_path: list[str] = []
+    for cid in cat_ids:
+        path = cat_paths.get(cid) or []
+        if len(path) > len(best_path):
+            best_path = path
+    if not best_path and cat_names:
+        best_path = [cat_names[0]]
+    cat_path_str = category_path_to_str(best_path) if best_path else "Other"
+
+    # Attributes
+    attrs: list[tuple[str, str]] = []
     for a in (p.get("attributes") or []):
         n = safe_text(a.get("name"))
         opts = a.get("options") or []
@@ -419,62 +595,90 @@ def wc_to_product(p: dict) -> dict:
     sale = parse_money(p.get("sale_price"))
     on_sale = bool(p.get("on_sale")) or (sale is not None and reg is not None and sale < reg)
 
-    img_url = None
-    imgs = p.get("images") or []
-    if imgs:
-        img_url = safe_text(imgs[0].get("src")) or None
+    # Images list (fallback order)
+    image_urls: list[str] = []
+    for im in (p.get("images") or []):
+        u = safe_text(im.get("src"))
+        if u and u.startswith("http"):
+            image_urls.append(u)
+
+    # Stock
+    stock_status = safe_text(p.get("stock_status")) or ""
 
     return {
         "id": p.get("id"),
         "name": safe_text(p.get("name")),
         "sku": safe_text(p.get("sku")),
-        "categories": cats,
+        "category_path": cat_path_str,          # Parent > Child > Grandchild
+        "categories_flat": cat_names,           # fallback list
         "short_desc": strip_html(p.get("short_description") or ""),
         "regular_price": reg,
         "sale_price": sale,
         "on_sale": on_sale,
         "attributes": attrs,
         "url": safe_text(p.get("permalink")) or "",
-        "stock_status": safe_text(p.get("stock_status")) or "",
-        "_img_url": img_url,
+        "stock_status": stock_status,
+        "_image_urls": image_urls,              # fallback order
         "_image_path": None,
     }
 
-def get_products_from_api_or_cache(
+
+def api_load_products_and_categories(
+    *,
     wc_url: str,
     wc_ck: str,
     wc_cs: str,
-    *,
+    include_unpublished: bool,
     timeout: int,
     force_refresh: bool,
     append_log=None,
     set_progress=None,
     set_count=None,
 ):
-    if not force_refresh:
-        cached_raw, fetched_at = api_cache_load()
-        if cached_raw is not None:
-            if append_log:
-                append_log(f"Loaded {len(cached_raw)} products from cache ({fetched_at}).")
-            if set_progress:
-                set_progress(1.0)
-            return [wc_to_product(x) for x in cached_raw], fetched_at, "disk_cache"
+    # Choose cache file depending on status mode
+    products_cache = API_PRODUCTS_ANY if include_unpublished else API_PRODUCTS_PUBLISH
 
-    raw = wc_fetch_products(
-        wc_url, wc_ck, wc_cs,
+    # Categories cache (shared)
+    cat_raw, cat_at = api_cache_load(API_CATEGORIES_CACHE)
+    if cat_raw is None or force_refresh:
+        if append_log:
+            append_log("Loading category hierarchy…")
+        cat_raw = wc_fetch_categories(wc_url, wc_ck, wc_cs, timeout=timeout, append_log=append_log, set_progress=set_progress) or []
+        api_cache_save(API_CATEGORIES_CACHE, cat_raw)
+        cat_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cat_paths = build_category_paths(cat_raw or [])
+
+    # Products cache
+    if not force_refresh:
+        prod_raw, prod_at = api_cache_load(products_cache)
+        if prod_raw is not None:
+            if append_log:
+                append_log(f"Loaded {len(prod_raw)} products from cache ({prod_at}).")
+            normalized = [wc_to_product(x, cat_paths) for x in prod_raw]
+            return normalized, prod_at, "disk_cache", cat_at
+
+    prod_raw = wc_fetch_products(
+        wc_url,
+        wc_ck,
+        wc_cs,
+        include_unpublished=include_unpublished,
         per_page=25,
         timeout=timeout,
         append_log=append_log,
         set_progress=set_progress,
         set_count=set_count,
     )
-    api_cache_save(raw)
-    fetched_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return [wc_to_product(x) for x in raw], fetched_at, "api"
+    api_cache_save(products_cache, prod_raw)
+    prod_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ----------------------------
-# CSV backup loader
-# ----------------------------
+    normalized = [wc_to_product(x, cat_paths) for x in prod_raw]
+    return normalized, prod_at, "api", cat_at
+
+
+# ============================
+# CSV BACKUP
+# ============================
 def read_csv_rows(uploaded_file) -> list[dict]:
     b = uploaded_file.getvalue()
     try:
@@ -483,6 +687,7 @@ def read_csv_rows(uploaded_file) -> list[dict]:
         text = b.decode("latin-1", errors="replace")
     return list(csv.DictReader(io.StringIO(text)))
 
+
 def best_key(keys: list[str], candidates: list[str]) -> str | None:
     lower = {k.lower(): k for k in keys}
     for c in candidates:
@@ -490,12 +695,112 @@ def best_key(keys: list[str], candidates: list[str]) -> str | None:
             return lower[c.lower()]
     return None
 
-# ----------------------------
-# PDF generation
-# ----------------------------
+
+def csv_to_products(rows: list[dict], base_url: str) -> list[dict]:
+    if not rows:
+        return []
+    keys = list(rows[0].keys())
+
+    col_id = best_key(keys, ["ID", "Id"])
+    col_name = best_key(keys, ["Name", "Product name", "Title"])
+    col_sku = best_key(keys, ["SKU"])
+    col_reg = best_key(keys, ["Regular price", "Regular Price", "Price"])
+    col_sale = best_key(keys, ["Sale price", "Sale Price"])
+    col_cats = best_key(keys, ["Categories", "Category"])
+    col_desc = best_key(keys, ["Short description", "Short Description", "Description"])
+    col_imgs = best_key(keys, ["Images", "Image", "Image URLs"])
+    col_url = best_key(keys, ["Permalink", "Product URL", "URL", "Link"])
+    col_stock = best_key(keys, ["Stock status", "Stock Status", "stock_status"])
+    col_slug = best_key(keys, ["Slug", "slug"])
+
+    products: list[dict] = []
+    for row in rows:
+        name = safe_text(row.get(col_name)) if col_name else ""
+        if not name:
+            continue
+
+        sku = safe_text(row.get(col_sku)) if col_sku else ""
+        desc = strip_html(row.get(col_desc)) if col_desc else ""
+
+        reg = parse_money(row.get(col_reg)) if col_reg else None
+        sale = parse_money(row.get(col_sale)) if col_sale else None
+        on_sale = (sale is not None and reg is not None and sale < reg)
+
+        stock_status = safe_text(row.get(col_stock)) if col_stock else ""
+        ss = stock_status.lower()
+        if "out" in ss:
+            stock_status = "outofstock"
+        elif "instock" in ss or "in stock" in ss:
+            stock_status = "instock"
+
+        # Category path not available in CSV reliably; treat first category as "path"
+        cats_flat = []
+        if col_cats:
+            cats_flat = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()]
+        cat_path = cats_flat[0] if cats_flat else "Other"
+
+        # Image URLs (try multiple)
+        image_urls: list[str] = []
+        if col_imgs:
+            s = safe_text(row.get(col_imgs))
+            if s:
+                found = re.findall(r"https?://\S+", s)
+                for u in found:
+                    # clean trailing commas/quotes
+                    u = u.strip().strip('",').strip("'").strip()
+                    if u.startswith("http"):
+                        image_urls.append(u)
+
+        url = safe_text(row.get(col_url)) if col_url else ""
+        if not url.startswith("http"):
+            pid = safe_text(row.get(col_id)) if col_id else ""
+            if pid.isdigit():
+                url = f"{base_url.rstrip('/')}/?post_type=product&p={pid}"
+            else:
+                slug = safe_text(row.get(col_slug)) if col_slug else ""
+                if slug:
+                    url = f"{base_url.rstrip('/')}/{slug.lstrip('/')}"
+
+        # Attributes (best-effort from typical Woo CSV columns)
+        attrs: list[tuple[str, str]] = []
+        for i in range(1, 21):
+            ncol = f"Attribute {i} name"
+            vcol = f"Attribute {i} value(s)"
+            if ncol in row and vcol in row:
+                n = safe_text(row.get(ncol))
+                v = safe_text(row.get(vcol))
+                if n and v:
+                    attrs.append((n, v))
+
+        products.append(
+            {
+                "id": safe_text(row.get(col_id)) if col_id else "",
+                "name": name,
+                "sku": sku,
+                "category_path": cat_path,
+                "categories_flat": cats_flat,
+                "short_desc": desc,
+                "regular_price": reg,
+                "sale_price": sale,
+                "on_sale": bool(on_sale),
+                "attributes": attrs,
+                "url": url,
+                "stock_status": stock_status,
+                "_image_urls": image_urls,
+                "_image_path": None,
+            }
+        )
+
+    return products
+
+
+# ============================
+# PDF
+# ============================
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
-    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
 
 class CatalogPDF(FPDF):
     def __init__(self, title: str, logo_path: str, brand_site: str, disclaimer: str, *args, **kwargs):
@@ -542,57 +847,93 @@ class CatalogPDF(FPDF):
         self.set_xy(12, y + 2)
         self.cell(0, 8, f"{self.brand_site} | {self.disclaimer}")
 
+
+def group_products_by_category_path(products: list[dict]) -> list[tuple[str, list[dict]]]:
+    groups: dict[str, list[dict]] = {}
+    for p in products:
+        key = safe_text(p.get("category_path")) or "Other"
+        groups.setdefault(key, []).append(p)
+
+    # sort groups by hierarchy string and then product name
+    out: list[tuple[str, list[dict]]] = []
+    for k in sorted(groups.keys(), key=lambda s: s.lower()):
+        items = groups[k]
+        items.sort(key=lambda p: safe_text(p.get("name")).lower())
+        out.append((k, items))
+    return out
+
+
 def make_catalog_pdf_bytes(
     products: list[dict],
     *,
     title: str,
-    page_size: str,
-    columns: int,
+    orientation: str,       # "Portrait" / "Landscape"
+    grid_mode: str,         # "Standard" / "Compact"
     currency_symbol: str,
     show_price: bool,
     show_sku: bool,
     show_desc: bool,
     show_attrs: bool,
     exclude_oos: bool,
+    only_sale: bool,
 ) -> bytes:
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
 
-    fmt = "A4" if page_size == "A4" else "Letter"
+    # A4 only (keeps it simple/reliable); orientation changes layout
+    orient_flag = "L" if orientation == "Landscape" else "P"
     pdf = CatalogPDF(
         title=title or DEFAULT_TITLE,
         logo_path=LOGO_PNG_PATH,
         brand_site=DEFAULT_SITE,
         disclaimer=disclaimer,
-        orientation="P",
+        orientation=orient_flag,
         unit="mm",
-        format=fmt,
+        format="A4",
     )
 
+    # Filter inside PDF (final safety)
+    working = []
+    for p in products:
+        if exclude_oos and safe_text(p.get("stock_status")).lower() == "outofstock":
+            continue
+        if only_sale and not bool(p.get("on_sale")):
+            continue
+        working.append(p)
+
+    grouped = group_products_by_category_path(working)
+
     margin = 12
-    gutter = 6
+    gutter = 5 if grid_mode == "Compact" else 6
     header_space = 28
     footer_space = 18
     category_bar_h = 10
 
-    usable_w = pdf.w - 2 * margin
-    card_w = (usable_w - (columns - 1) * gutter) / columns
+    # Decide rows/cols based on orientation + grid_mode
+    if orientation == "Portrait":
+        # as requested: default 3x3, option 6x6
+        if grid_mode == "Compact":
+            cols, rows = 6, 6
+        else:
+            cols, rows = 3, 3
+    else:
+        # landscape: make it "nice" (bigger readable cards)
+        # Standard -> 4x3, Compact -> 8x4 (still "compact", but readable)
+        if grid_mode == "Compact":
+            cols, rows = 8, 4
+        else:
+            cols, rows = 4, 3
 
-    rows = 3  # 3x3 target
+    usable_w = pdf.w - 2 * margin
     usable_h = pdf.h - header_space - footer_space - category_bar_h - 8
+
+    card_w = (usable_w - (cols - 1) * gutter) / cols
     card_h = (usable_h - (rows - 1) * gutter) / rows
 
-    grouped = {}
-    for p in products:
-        if exclude_oos and not is_in_stock(p):
-            continue
-        grouped.setdefault(primary_category(p), []).append(p)
-
-    cats = sorted(grouped.keys(), key=lambda s: s.lower())
     blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
     red_rgb = hex_to_rgb(BRAND_RED_HEX)
 
-    # Contents
+    # CONTENTS
     pdf.add_page()
     pdf.set_text_color(*blue_rgb)
     pdf.set_font("Helvetica", "B", 20)
@@ -604,19 +945,21 @@ def make_catalog_pdf_bytes(
     pdf.set_x(margin)
     pdf.cell(0, 7, disclaimer, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    per_page = rows * columns
+    # estimate pages per group
+    per_page = rows * cols
     page_no = 2
-    cat_first = {}
-    for cat in cats:
-        n = len(grouped.get(cat, []))
-        if n:
-            cat_first[cat] = page_no
-            page_no += math.ceil(n / per_page)
+    first_page_for_group: dict[str, int] = {}
+    for cat, items in grouped:
+        if items:
+            first_page_for_group[cat] = page_no
+            page_no += math.ceil(len(items) / per_page)
 
     pdf.set_text_color(17, 24, 39)
     pdf.set_font("Helvetica", "", 11)
     y = 60
-    for cat in cats:
+    for cat, items in grouped:
+        if not items:
+            continue
         if y > pdf.h - 30:
             pdf.add_page()
             y = 40
@@ -624,13 +967,12 @@ def make_catalog_pdf_bytes(
         pdf.cell(0, 7, pdf_safe(cat))
         pdf.set_xy(pdf.w - margin - 25, y)
         pdf.set_text_color(107, 114, 128)
-        pdf.cell(25, 7, str(cat_first.get(cat, "")), align="R")
+        pdf.cell(25, 7, str(first_page_for_group.get(cat, "")), align="R")
         pdf.set_text_color(17, 24, 39)
         y += 8
 
-    # Category pages
-    for cat in cats:
-        items = grouped.get(cat, [])
+    # PAGES
+    for cat, items in grouped:
         if not items:
             continue
 
@@ -638,12 +980,12 @@ def make_catalog_pdf_bytes(
         while idx < len(items):
             pdf.add_page()
 
-            # Category bar
+            # Brand category divider bar
             pdf.set_fill_color(*blue_rgb)
             bar_y = header_space
             pdf.rect(margin, bar_y, pdf.w - 2 * margin, category_bar_h, style="F")
             pdf.set_text_color(255, 255, 255)
-            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_font("Helvetica", "B", 10.5 if grid_mode == "Compact" else 11)
             pdf.set_xy(margin + 4, bar_y + 2.2)
             pdf.cell(0, 6, pdf_safe(cat))
 
@@ -653,27 +995,30 @@ def make_catalog_pdf_bytes(
                 yy = start_y + r * (card_h + gutter)
                 xx = margin
 
-                for _c in range(columns):
+                for c in range(cols):
                     if idx >= len(items):
                         break
+
                     p = items[idx]
                     idx += 1
 
+                    # Card border
                     pdf.set_draw_color(*blue_rgb)
-                    pdf.set_line_width(0.5)
+                    pdf.set_line_width(0.4 if grid_mode == "Compact" else 0.5)
                     pdf.rect(xx, yy, card_w, card_h, style="D")
 
-                    # Clickable card
+                    # Clickable card link
                     url = safe_text(p.get("url"))
                     if url.startswith("http"):
                         pdf.link(x=xx, y=yy, w=card_w, h=card_h, link=url)
 
-                    pad = 3.5
-                    img_h = card_h * 0.48
+                    pad = 2.6 if grid_mode == "Compact" else 3.5
+                    img_h = card_h * (0.44 if grid_mode == "Compact" else 0.48)
                     img_w = card_w - 2 * pad
                     img_x = xx + pad
-                    img_y = yy + pad + 3
+                    img_y = yy + pad + 2.2
 
+                    # Image
                     if p.get("_image_path"):
                         try:
                             pdf.image(p["_image_path"], x=img_x, y=img_y, w=img_w, h=img_h)
@@ -681,9 +1026,22 @@ def make_catalog_pdf_bytes(
                             pass
                     else:
                         pdf.set_text_color(120, 120, 120)
-                        pdf.set_font("Helvetica", "I", 8)
+                        pdf.set_font("Helvetica", "I", 7.5 if grid_mode == "Compact" else 8)
                         pdf.set_xy(xx, img_y + img_h / 2 - 2)
                         pdf.cell(card_w, 4, "No image", align="C")
+
+                    # Sale badge (top-right)
+                    if bool(p.get("on_sale")):
+                        badge_w = min(18, card_w * 0.45)
+                        badge_h = 6
+                        bx = xx + card_w - badge_w - 1.2
+                        by = yy + 1.2
+                        pdf.set_fill_color(*red_rgb)
+                        pdf.rect(bx, by, badge_w, badge_h, style="F")
+                        pdf.set_text_color(255, 255, 255)
+                        pdf.set_font("Helvetica", "B", 7.5)
+                        pdf.set_xy(bx, by + 1.3)
+                        pdf.cell(badge_w, 3.4, "SALE", align="C")
 
                     tx = xx + pad
                     max_w = card_w - 2 * pad
@@ -691,13 +1049,13 @@ def make_catalog_pdf_bytes(
 
                     # Name
                     pdf.set_text_color(0, 0, 0)
-                    pdf.set_font("Helvetica", "B", 9.5)
+                    pdf.set_font("Helvetica", "B", 7.8 if grid_mode == "Compact" else 9.5)
                     name = truncate_to_fit(pdf, safe_text(p.get("name")).replace("\n", " "), max_w)
                     pdf.set_xy(tx, line_y)
-                    pdf.cell(max_w, 4.5, name)
-                    line_y += 5.2
+                    pdf.cell(max_w, 4.2, name)
+                    line_y += 4.8 if grid_mode == "Compact" else 5.2
 
-                    # Price
+                    # Price (dual pricing if on sale)
                     if show_price:
                         reg = p.get("regular_price")
                         sale = p.get("sale_price")
@@ -705,46 +1063,46 @@ def make_catalog_pdf_bytes(
 
                         if on_sale:
                             pdf.set_text_color(*red_rgb)
-                            pdf.set_font("Helvetica", "B", 10)
+                            pdf.set_font("Helvetica", "B", 8.6 if grid_mode == "Compact" else 10)
                             pdf.set_xy(tx, line_y)
-                            pdf.cell(0, 5, pdf_safe(fmt_money(currency_symbol, sale)))
+                            pdf.cell(0, 4.8, pdf_safe(fmt_money(currency_symbol, sale)))
 
                             pdf.set_text_color(107, 114, 128)
-                            pdf.set_font("Helvetica", "", 8.5)
+                            pdf.set_font("Helvetica", "", 7.0 if grid_mode == "Compact" else 8.5)
                             reg_txt = pdf_safe(fmt_money(currency_symbol, reg))
-                            rx = tx + 18
-                            pdf.set_xy(rx, line_y + 0.6)
-                            pdf.cell(0, 4, reg_txt)
+                            rx = tx + (13 if grid_mode == "Compact" else 18)
+                            pdf.set_xy(rx, line_y + 0.4)
+                            pdf.cell(0, 3.8, reg_txt)
                             wtxt = pdf.get_string_width(reg_txt)
                             pdf.set_draw_color(107, 114, 128)
-                            pdf.set_line_width(0.3)
-                            pdf.line(rx, line_y + 2.5, rx + wtxt, line_y + 2.5)
-                            line_y += 6
+                            pdf.set_line_width(0.25)
+                            pdf.line(rx, line_y + 2.1, rx + wtxt, line_y + 2.1)
+                            line_y += 5.3
                         else:
                             if reg is not None:
                                 pdf.set_text_color(*red_rgb)
-                                pdf.set_font("Helvetica", "B", 10)
+                                pdf.set_font("Helvetica", "B", 8.6 if grid_mode == "Compact" else 10)
                                 pdf.set_xy(tx, line_y)
-                                pdf.cell(0, 5, pdf_safe(fmt_money(currency_symbol, reg)))
-                                line_y += 6
+                                pdf.cell(0, 4.8, pdf_safe(fmt_money(currency_symbol, reg)))
+                                line_y += 5.3
                         pdf.set_text_color(0, 0, 0)
 
-                    # SKU
+                    # SKU (default OFF)
                     if show_sku:
                         sku = safe_text(p.get("sku"))
                         if sku:
                             pdf.set_text_color(31, 41, 55)
-                            pdf.set_font("Helvetica", "", 8.5)
+                            pdf.set_font("Helvetica", "", 6.6 if grid_mode == "Compact" else 8.5)
                             pdf.set_xy(tx, line_y)
-                            pdf.cell(0, 4, pdf_safe(f"SKU: {sku}"))
-                            line_y += 4.5
+                            pdf.cell(0, 3.8, pdf_safe(f"SKU: {sku}"))
+                            line_y += 4.1
 
-                    # Attributes (2 lines)
+                    # Attributes (up to 2 lines)
                     if show_attrs:
                         attrs = p.get("attributes") or []
                         if attrs:
                             pdf.set_text_color(55, 65, 81)
-                            pdf.set_font("Helvetica", "", 7.8)
+                            pdf.set_font("Helvetica", "", 6.0 if grid_mode == "Compact" else 7.8)
                             shown = 0
                             for (an, av) in attrs:
                                 if shown >= 2:
@@ -755,31 +1113,31 @@ def make_catalog_pdf_bytes(
                                     continue
                                 line = truncate_to_fit(pdf, f"{an}: {av}", max_w)
                                 pdf.set_xy(tx, line_y)
-                                pdf.cell(0, 4, line)
-                                line_y += 4.0
+                                pdf.cell(0, 3.6, line)
+                                line_y += 3.7
                                 shown += 1
 
-                    # Description (2 lines)
+                    # Description (default OFF) — wrap to 2 lines
                     if show_desc:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
                             pdf.set_text_color(75, 85, 99)
-                            pdf.set_font("Helvetica", "", 7.6)
+                            pdf.set_font("Helvetica", "", 5.8 if grid_mode == "Compact" else 7.6)
                             lines = wrap_two_lines(pdf, desc, max_w)
                             for ln in lines:
                                 pdf.set_xy(tx, line_y)
-                                pdf.cell(0, 4, ln)
-                                line_y += 4.0
+                                pdf.cell(0, 3.5, ln)
+                                line_y += 3.6
 
                     xx += card_w + gutter
 
-    # Output -> STRICT bytes
     out = pdf.output()
     return strict_bytes(out)
 
-# ============================================================
+
+# ============================
 # UI
-# ============================================================
+# ============================
 login_gate()
 
 # session defaults
@@ -804,9 +1162,12 @@ with st.sidebar:
     else:
         st.error("Woo API secrets missing (WC_URL / WC_CK / WC_CS)")
 
-    cached_raw, cached_at = api_cache_load()
-    if cached_raw is not None:
-        st.info(f"API cache: {len(cached_raw):,} • Last fetch: {cached_at}")
+    pub_raw, pub_at = api_cache_load(API_PRODUCTS_PUBLISH)
+    any_raw, any_at = api_cache_load(API_PRODUCTS_ANY)
+    if pub_raw is not None:
+        st.info(f"Cache (publish): {len(pub_raw):,} • {pub_at}")
+    if any_raw is not None:
+        st.info(f"Cache (any): {len(any_raw):,} • {any_at}")
 
     if st.button("Logout"):
         st.session_state.authenticated = False
@@ -835,6 +1196,12 @@ if st.session_state.step >= 2:
 
     if data_source == "WooCommerce API":
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
+
+        include_unpublished = st.checkbox(
+            "Include private/unpublished products (requires API user permission)",
+            value=False,
+        )
+
         c1, c2 = st.columns(2)
         load_cached = c1.button("Load (use cache if available)")
         refresh = c2.button("Refresh cache (fetch again)")
@@ -844,7 +1211,7 @@ if st.session_state.step >= 2:
             status = st.empty()
             count_box = st.empty()
             log_box = st.empty()
-            logs = []
+            logs: list[str] = []
 
             def append_log(msg: str):
                 logs.append(msg)
@@ -861,8 +1228,11 @@ if st.session_state.step >= 2:
 
             try:
                 status.info("Fetching products from API…")
-                products, fetched_at, source = get_products_from_api_or_cache(
-                    WC_URL, WC_CK, WC_CS,
+                products, prod_at, source, cat_at = api_load_products_and_categories(
+                    wc_url=WC_URL,
+                    wc_ck=WC_CK,
+                    wc_cs=WC_CS,
+                    include_unpublished=bool(include_unpublished),
                     timeout=int(api_timeout),
                     force_refresh=bool(refresh),
                     append_log=append_log,
@@ -874,7 +1244,9 @@ if st.session_state.step >= 2:
 
                 st.session_state.products_raw = products
                 st.session_state.step = 3
-                st.success(f"Loaded {len(products):,} products • Source: {source} • Cached at: {fetched_at}")
+                st.success(
+                    f"Loaded {len(products):,} products • Source: {source} • Products cached at: {prod_at} • Categories cached at: {cat_at}"
+                )
                 st.rerun()
             except Exception as e:
                 st.error(str(e))
@@ -885,87 +1257,10 @@ if st.session_state.step >= 2:
         csv_file = st.file_uploader("Upload WooCommerce CSV export", type=["csv"])
         if st.button("Load from CSV", disabled=(csv_file is None)):
             rows = read_csv_rows(csv_file)
-            if not rows:
-                st.error("CSV empty.")
+            products = csv_to_products(rows, base_url=base_url)
+            if not products:
+                st.error("No products found in CSV.")
                 st.stop()
-
-            keys = list(rows[0].keys())
-            col_id = best_key(keys, ["ID", "Id"])
-            col_name = best_key(keys, ["Name", "Product name", "Title"])
-            col_sku = best_key(keys, ["SKU"])
-            col_reg = best_key(keys, ["Regular price", "Regular Price", "Price"])
-            col_sale = best_key(keys, ["Sale price", "Sale Price"])
-            col_cats = best_key(keys, ["Categories", "Category"])
-            col_desc = best_key(keys, ["Short description", "Short Description", "Description"])
-            col_imgs = best_key(keys, ["Images", "Image", "Image URLs"])
-            col_url = best_key(keys, ["Permalink", "Product URL", "URL", "Link"])
-            col_stock = best_key(keys, ["Stock status", "Stock Status", "stock_status"])
-            col_slug = best_key(keys, ["Slug", "slug"])
-
-            products = []
-            for row in rows:
-                name = safe_text(row.get(col_name)) if col_name else ""
-                if not name:
-                    continue
-
-                sku = safe_text(row.get(col_sku)) if col_sku else ""
-                cats = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()] if col_cats else []
-                desc = strip_html(row.get(col_desc)) if col_desc else ""
-                reg = parse_money(row.get(col_reg)) if col_reg else None
-                sale = parse_money(row.get(col_sale)) if col_sale else None
-                on_sale = (sale is not None and reg is not None and sale < reg)
-
-                stock_status = safe_text(row.get(col_stock)) if col_stock else ""
-                ss = stock_status.lower()
-                if "out" in ss:
-                    stock_status = "outofstock"
-                elif "instock" in ss or "in stock" in ss:
-                    stock_status = "instock"
-
-                img_url = None
-                if col_imgs:
-                    s = safe_text(row.get(col_imgs))
-                    if s:
-                        m = re.search(r"https?://\S+", s)
-                        if m:
-                            img_url = m.group(0)
-
-                url = safe_text(row.get(col_url)) if col_url else ""
-                if not url.startswith("http"):
-                    pid = safe_text(row.get(col_id)) if col_id else ""
-                    if pid.isdigit():
-                        url = f"{base_url.rstrip('/')}/?post_type=product&p={pid}"
-                    else:
-                        slug = safe_text(row.get(col_slug)) if col_slug else ""
-                        if slug:
-                            url = f"{base_url.rstrip('/')}/{slug.lstrip('/')}"
-
-                attrs = []
-                for i in range(1, 21):
-                    ncol = f"Attribute {i} name"
-                    vcol = f"Attribute {i} value(s)"
-                    if ncol in row and vcol in row:
-                        n = safe_text(row.get(ncol))
-                        v = safe_text(row.get(vcol))
-                        if n and v:
-                            attrs.append((n, v))
-
-                products.append({
-                    "id": safe_text(row.get(col_id)) if col_id else "",
-                    "name": name,
-                    "sku": sku,
-                    "categories": cats,
-                    "short_desc": desc,
-                    "regular_price": reg,
-                    "sale_price": sale,
-                    "on_sale": bool(on_sale),
-                    "attributes": attrs,
-                    "url": url,
-                    "stock_status": stock_status,
-                    "_img_url": img_url,
-                    "_image_path": None,
-                })
-
             st.session_state.products_raw = products
             st.session_state.step = 3
             st.success(f"Loaded {len(products):,} products from CSV.")
@@ -973,45 +1268,109 @@ if st.session_state.step >= 2:
 
 # Step 3
 if st.session_state.step >= 3:
-    st.subheader("Step 3 — Filter & layout")
+    st.subheader("Step 3 — Filters & layout")
     products = st.session_state.products_raw
 
+    # Quick presets
+    st.markdown("### Quick presets")
+    p1, p2, p3 = st.columns(3)
+    if p1.button("Standard (3×3 / friendly)", use_container_width=True):
+        st.session_state.preset_choice = "Standard"
+        st.session_state.only_sale = False
+    if p2.button("Compact (6×6 portrait)", use_container_width=True):
+        st.session_state.preset_choice = "Compact"
+        st.session_state.only_sale = False
+    if p3.button("Sale-only (Standard)", use_container_width=True):
+        st.session_state.preset_choice = "Standard"
+        st.session_state.only_sale = True
+
+    if "preset_choice" not in st.session_state:
+        st.session_state.preset_choice = "Standard"
+    if "only_sale" not in st.session_state:
+        st.session_state.only_sale = False
+
     title = st.text_input("Catalog title", value=DEFAULT_TITLE)
-    page_size = st.selectbox("Page size", ["A4", "Letter"], index=0)
-    columns = st.selectbox("Cards per row", [1, 2, 3], index=2)
+
+    orientation = st.selectbox("Page orientation", ["Portrait", "Landscape"], index=0)
+
+    grid_mode = st.selectbox(
+        "Grid density",
+        ["Standard", "Compact"],
+        index=0 if st.session_state.preset_choice == "Standard" else 1,
+        help="Portrait: Standard=3×3, Compact=6×6. Landscape auto-adjusts to keep cards readable.",
+    )
+
     currency = st.text_input("Currency symbol", value="£")
+
     preset = st.selectbox("Image download preset", ["Reliable", "Normal", "Fast"], index=0)
 
+    # Defaults requested: SKU unticked, description unticked
     show_price = st.checkbox("Show price", value=True)
-    show_sku = st.checkbox("Show SKU", value=True)
-    show_desc = st.checkbox("Show description", value=True)
+    show_sku = st.checkbox("Show SKU", value=False)
+    show_desc = st.checkbox("Show description", value=False)
     show_attrs = st.checkbox("Show attributes", value=True)
     exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
 
-    all_cats = sorted({c for p in products for c in (p.get("categories") or []) if c}, key=lambda s: s.lower())
-    selected_cats = st.multiselect("Categories (optional)", all_cats, default=[])
+    only_sale = st.checkbox("Only sale items", value=bool(st.session_state.only_sale))
+    st.session_state.only_sale = only_sale
+    st.session_state.preset_choice = grid_mode
+
+    # Category tree selector (paths)
+    all_paths = sorted({safe_text(p.get("category_path")) or "Other" for p in products}, key=lambda s: s.lower())
+    selected_paths = st.multiselect("Categories (tree)", all_paths, default=[])
+
     q = st.text_input("Search (name or SKU)", value="").strip().lower()
 
     filtered = products[:]
-    if selected_cats:
-        sset = set(selected_cats)
-        filtered = [p for p in filtered if set(p.get("categories") or []).intersection(sset)]
+    if selected_paths:
+        sset = set(selected_paths)
+        filtered = [p for p in filtered if (safe_text(p.get("category_path")) or "Other") in sset]
     if q:
-        filtered = [p for p in filtered if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())]
+        filtered = [
+            p
+            for p in filtered
+            if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())
+        ]
     if exclude_oos:
-        filtered = [p for p in filtered if is_in_stock(p)]
+        filtered = [p for p in filtered if safe_text(p.get("stock_status")).lower() != "outofstock"]
+    if only_sale:
+        filtered = [p for p in filtered if bool(p.get("on_sale"))]
 
-    filtered.sort(key=lambda p: (primary_category(p).lower(), safe_text(p.get("name")).lower()))
+    # Sort by full category path (parent>child>grandchild) then product
+    filtered.sort(key=lambda p: ((safe_text(p.get("category_path")) or "Other").lower(), safe_text(p.get("name")).lower()))
     st.session_state.products_filtered = filtered
 
     st.info(f"Selected products: {len(filtered):,}")
+
+    # Preview (small) - first 9 items
+    with st.expander("Preview (first 9 products)", expanded=False):
+        preview = filtered[:9]
+        if not preview:
+            st.write("No products selected.")
+        else:
+            cols = st.columns(3)
+            for i, p in enumerate(preview):
+                with cols[i % 3]:
+                    st.write(f"**{p.get('name','')}**")
+                    st.caption(safe_text(p.get("category_path")))
+                    if show_price:
+                        reg = p.get("regular_price")
+                        sale = p.get("sale_price")
+                        if p.get("on_sale") and sale is not None:
+                            st.write(f"**{fmt_money(currency, sale)}**  ~~{fmt_money(currency, reg)}~~")
+                        elif reg is not None:
+                            st.write(f"**{fmt_money(currency, reg)}**")
+                    if show_sku and safe_text(p.get("sku")):
+                        st.caption(f"SKU: {p.get('sku')}")
+                    if show_desc and safe_text(p.get("short_desc")):
+                        st.caption(p.get("short_desc")[:120] + ("…" if len(p.get("short_desc")) > 120 else ""))
 
     if st.button("Continue → Generate PDF", disabled=(len(filtered) == 0)):
         st.session_state.step = 4
         st.session_state._settings = {
             "title": title,
-            "page_size": page_size,
-            "columns": int(columns),
+            "orientation": orientation,
+            "grid_mode": grid_mode,
             "currency": currency,
             "preset": preset,
             "show_price": bool(show_price),
@@ -1019,6 +1378,7 @@ if st.session_state.step >= 3:
             "show_desc": bool(show_desc),
             "show_attrs": bool(show_attrs),
             "exclude_oos": bool(exclude_oos),
+            "only_sale": bool(only_sale),
         }
         st.rerun()
 
@@ -1039,14 +1399,16 @@ if st.session_state.step >= 4:
     progress = st.progress(0.0)
     status = st.empty()
     log_box = st.empty()
-    logs = []
+    logs: list[str] = []
     t0 = time.time()
 
     def append_log(msg: str):
         logs.append(f"[{time.time()-t0:6.1f}s] {msg}")
         log_box.markdown("<div class='bk_log'>" + html.escape("\n".join(logs[-30:])) + "</div>", unsafe_allow_html=True)
 
-    items = [p for p in filtered if p.get("_img_url")]
+    # Image download with fallback order
+    # We'll attempt images for products that don't yet have _image_path
+    items = [p for p in filtered if (p.get("_image_urls") or [])]
     total = max(1, len(items))
     done = 0
     ok = 0
@@ -1055,21 +1417,25 @@ if st.session_state.step >= 4:
     append_log(f"Preset={preset} workers={dl_workers} retries={dl_retries}")
 
     def dl_task(p: dict):
-        b = download_with_retries(
-            p["_img_url"],
-            timeout=dl_timeout,
-            retries=dl_retries,
-            backoff=dl_backoff,
-            append_log=append_log,
-        )
-        return p, b
+        urls = p.get("_image_urls") or []
+        for u in urls:
+            b = download_with_retries(
+                u,
+                timeout=dl_timeout,
+                retries=dl_retries,
+                backoff=dl_backoff,
+                append_log=append_log,
+            )
+            if b:
+                return p, u, True
+        return p, None, False
 
     with ThreadPoolExecutor(max_workers=dl_workers) as ex:
         futures = [ex.submit(dl_task, p) for p in items]
         for fut in as_completed(futures):
-            p, b = fut.result()
-            if b:
-                p["_image_path"] = str(cache_path_for_url(p["_img_url"]))
+            p, u, success = fut.result()
+            if success and u:
+                p["_image_path"] = str(cache_path_for_url(u))
                 ok += 1
             done += 1
             progress.progress(min(0.75, (done / total) * 0.75))
@@ -1082,14 +1448,15 @@ if st.session_state.step >= 4:
     pdf_bytes = make_catalog_pdf_bytes(
         filtered,
         title=settings.get("title", DEFAULT_TITLE),
-        page_size=settings.get("page_size", "A4"),
-        columns=int(settings.get("columns", 3)),
+        orientation=settings.get("orientation", "Portrait"),
+        grid_mode=settings.get("grid_mode", "Standard"),
         currency_symbol=settings.get("currency", "£"),
         show_price=bool(settings.get("show_price", True)),
-        show_sku=bool(settings.get("show_sku", True)),
-        show_desc=bool(settings.get("show_desc", True)),
+        show_sku=bool(settings.get("show_sku", False)),
+        show_desc=bool(settings.get("show_desc", False)),
         show_attrs=bool(settings.get("show_attrs", True)),
         exclude_oos=bool(settings.get("exclude_oos", True)),
+        only_sale=bool(settings.get("only_sale", False)),
     )
 
     # FINAL SAFETY: ensure bytes only
