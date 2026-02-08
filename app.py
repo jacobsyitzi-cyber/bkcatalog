@@ -1,6 +1,6 @@
-# app.py — B-Kosher Catalog Builder (Streamlit Cloud SAFE + RESUME IMPORT)
+# app.py — B-Kosher Catalog Builder (Streamlit Cloud SAFE, resumable API import)
 #
-# requirements.txt:
+# requirements.txt (recommended):
 # streamlit==1.31.1
 # requests==2.31.0
 # Pillow==10.4.0
@@ -17,7 +17,6 @@ import hashlib
 import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
 import requests
 import streamlit as st
@@ -26,10 +25,12 @@ from PIL import Image
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
+
 # ============================
 # VERSION
 # ============================
-APP_VERSION = "2026-02-08-build-now-v3"
+APP_VERSION = "2026-02-08-fresh-rebuild-parent-cats-private-resume"
+
 
 # ============================
 # BRANDING
@@ -41,10 +42,13 @@ DEFAULT_TITLE = "B-Kosher Product Catalog"
 DEFAULT_SITE = "www.b-kosher.co.uk"
 DEFAULT_BASE_URL = "https://www.b-kosher.co.uk"
 
-# Logo in repo root:
-# Bkosher.png
-LOGO_PNG_PATH = "Bkosher.png"
+# Put your logo in the repo root with this exact name:
+LOGO_PNG_PATH = "B-kosher logo high q.png"
 
+
+# ============================
+# STREAMLIT PAGE
+# ============================
 st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
 
 st.markdown(
@@ -81,6 +85,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+
 # ============================
 # SECRETS
 # ============================
@@ -90,10 +95,12 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         return default
 
+
 APP_PASSWORD = get_secret("APP_PASSWORD", "")
 WC_URL = get_secret("WC_URL", "")
 WC_CK = get_secret("WC_CK", "")
 WC_CS = get_secret("WC_CS", "")
+
 
 # ============================
 # LOGIN
@@ -118,6 +125,7 @@ def login_gate():
         st.error("Incorrect password.")
     st.stop()
 
+
 # ============================
 # BYTES SAFETY (download_button fix)
 # ============================
@@ -131,6 +139,7 @@ def strict_bytes(x) -> bytes:
     if isinstance(x, str):
         return x.encode("latin-1", "ignore")
     return bytes(x)
+
 
 # ============================
 # TEXT HELPERS
@@ -155,6 +164,7 @@ def pdf_safe(s: str) -> str:
     except Exception:
         return s.encode("latin-1", "ignore").decode("latin-1")
 
+
 def safe_text(v) -> str:
     if v is None:
         return ""
@@ -163,6 +173,7 @@ def safe_text(v) -> str:
         return ""
     return pdf_safe(s)
 
+
 def strip_html(s: str) -> str:
     s = safe_text(s)
     if not s:
@@ -170,6 +181,7 @@ def strip_html(s: str) -> str:
     s = re.sub(r"<[^>]+>", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def parse_money(v):
     s = safe_text(v)
@@ -181,24 +193,17 @@ def parse_money(v):
     except Exception:
         return None
 
+
 def fmt_money(symbol: str, v):
     if v is None:
         return ""
     return f"{symbol}{float(v):.2f}"  # FORCE 2dp
 
-def sanitize_url(u: str) -> str:
-    try:
-        parts = urlsplit(u)
-        q = parse_qsl(parts.query, keep_blank_values=True)
-        q = [(k, v) for (k, v) in q if k not in ("consumer_key", "consumer_secret")]
-        clean = urlencode(q)
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, clean, parts.fragment))
-    except Exception:
-        return (u or "").replace("consumer_key=", "consumer_key=***").replace("consumer_secret=", "consumer_secret=***")
 
 def hex_to_rgb(h: str):
     h = h.lstrip("#")
     return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
+
 
 def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
     t = pdf_safe(text)
@@ -208,6 +213,7 @@ def truncate_to_fit(pdf: FPDF, text: str, max_w: float) -> str:
     while t and pdf.get_string_width(t + ell) > max_w:
         t = t[:-1]
     return (t + ell) if t else ell
+
 
 def wrap_lines(pdf: FPDF, text: str, max_w: float, max_lines: int) -> list[str]:
     """Word-wrap into <= max_lines. If truncated, last line gets ellipsis."""
@@ -228,12 +234,10 @@ def wrap_lines(pdf: FPDF, text: str, max_w: float, max_lines: int) -> list[str]:
             else:
                 break
         if not line:
-            # single very long word
             line = truncate_to_fit(pdf, words.pop(0), max_w)
         lines.append(line)
 
     if words and lines:
-        # add ellipsis to last line
         last = lines[-1]
         ell = "..."
         while last and pdf.get_string_width(last + ell) > max_w:
@@ -242,8 +246,9 @@ def wrap_lines(pdf: FPDF, text: str, max_w: float, max_lines: int) -> list[str]:
 
     return lines
 
+
 # ============================
-# CACHE (images + api)
+# CACHE DIRS
 # ============================
 IMAGE_CACHE_DIR = Path("./image_cache")
 IMAGE_CACHE_DIR.mkdir(exist_ok=True)
@@ -251,13 +256,17 @@ IMAGE_CACHE_DIR.mkdir(exist_ok=True)
 API_CACHE_DIR = Path("./api_cache")
 API_CACHE_DIR.mkdir(exist_ok=True)
 
-API_PRODUCTS_PUBLISH = API_CACHE_DIR / "products_publish.json"
-API_PRODUCTS_ANY = API_CACHE_DIR / "products_any.json"
 API_CATEGORIES_CACHE = API_CACHE_DIR / "categories.json"
+API_PRODUCTS_CACHE = API_CACHE_DIR / "products_resumable.json"  # holds publish (+ private if requested)
 
+
+# ============================
+# IMAGE CACHE
+# ============================
 def cache_path_for_url(url: str) -> Path:
     h = hashlib.sha1(url.encode("utf-8")).hexdigest()
     return IMAGE_CACHE_DIR / f"{h}.jpg"
+
 
 def read_image_cache(url: str):
     p = cache_path_for_url(url)
@@ -268,11 +277,13 @@ def read_image_cache(url: str):
             return None
     return None
 
+
 def write_image_cache(url: str, b: bytes):
     try:
         cache_path_for_url(url).write_bytes(b)
     except Exception:
         pass
+
 
 def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82):
     try:
@@ -286,6 +297,7 @@ def resize_to_jpeg_bytes(raw: bytes, max_px: int = 900, quality: int = 82):
         return out.getvalue()
     except Exception:
         return None
+
 
 def download_with_retries(url: str, *, timeout: int, retries: int, backoff: float, append_log=None):
     if not url or not url.startswith("http"):
@@ -311,58 +323,96 @@ def download_with_retries(url: str, *, timeout: int, retries: int, backoff: floa
             return final
         except Exception as e:
             if append_log and attempt == retries:
-                append_log(f"Image failed: {url[:70]}… ({type(e).__name__})")
+                append_log(f"Image failed: {url[:80]}… ({type(e).__name__})")
             continue
     return None
 
-# ----------------------------
-# Resumable API cache format
-# ----------------------------
-def progress_cache_load(path: Path):
-    if not path.exists():
-        return {"data": [], "in_progress": False, "next_page": 1, "fetched_at": ""}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+
+# ============================
+# RESUMABLE API CACHE FORMAT
+# ============================
+# We avoid status=any entirely:
+# - fetch publish pages
+# - optionally fetch private pages
+# We store progress in one JSON file:
+#
+# {
+#   "fetched_at": "...",
+#   "in_progress": true/false,
+#   "phase": "publish" or "private",
+#   "next_page": 1,
+#   "include_private_fetch": false/true,
+#   "data": [ raw_product_json ...]
+# }
+#
+def cache_load_products():
+    if not API_PRODUCTS_CACHE.exists():
         return {
-            "data": payload.get("data", []) or [],
-            "in_progress": bool(payload.get("in_progress", False)),
-            "next_page": int(payload.get("next_page", 1) or 1),
+            "fetched_at": "",
+            "in_progress": False,
+            "phase": "publish",
+            "next_page": 1,
+            "include_private_fetch": False,
+            "data": [],
+        }
+    try:
+        payload = json.loads(API_PRODUCTS_CACHE.read_text(encoding="utf-8"))
+        return {
             "fetched_at": payload.get("fetched_at", "") or "",
+            "in_progress": bool(payload.get("in_progress", False)),
+            "phase": payload.get("phase", "publish") or "publish",
+            "next_page": int(payload.get("next_page", 1) or 1),
+            "include_private_fetch": bool(payload.get("include_private_fetch", False)),
+            "data": payload.get("data", []) or [],
         }
     except Exception:
-        return {"data": [], "in_progress": False, "next_page": 1, "fetched_at": ""}
+        return {
+            "fetched_at": "",
+            "in_progress": False,
+            "phase": "publish",
+            "next_page": 1,
+            "include_private_fetch": False,
+            "data": [],
+        }
 
-def progress_cache_save(path: Path, *, data: list, in_progress: bool, next_page: int):
-    payload = {
-        "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "in_progress": bool(in_progress),
-        "next_page": int(next_page),
-        "data": data,
-    }
-    path.write_text(json.dumps(payload), encoding="utf-8")
 
-def simple_cache_load(path: Path):
-    if not path.exists():
+def cache_save_products(state: dict):
+    state = dict(state)
+    state["fetched_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    API_PRODUCTS_CACHE.write_text(json.dumps(state), encoding="utf-8")
+
+
+def cache_clear_products():
+    try:
+        API_PRODUCTS_CACHE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def cache_load_categories():
+    if not API_CATEGORIES_CACHE.exists():
         return None, ""
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(API_CATEGORIES_CACHE.read_text(encoding="utf-8"))
         data = payload.get("data")
-        fetched_at = payload.get("fetched_at", "")
+        at = payload.get("fetched_at", "")
         if isinstance(data, list):
-            return data, fetched_at
+            return data, at
     except Exception:
         pass
     return None, ""
 
-def simple_cache_save(path: Path, data_list: list):
+
+def cache_save_categories(data_list: list):
     payload = {
         "fetched_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "data": data_list,
     }
-    path.write_text(json.dumps(payload), encoding="utf-8")
+    API_CATEGORIES_CACHE.write_text(json.dumps(payload), encoding="utf-8")
+
 
 # ============================
-# WOO API (with resume)
+# WOO API
 # ============================
 def wc_fetch_categories(base_url: str, ck: str, cs: str, *, timeout=30, append_log=None, set_progress=None):
     base_url = base_url.rstrip("/")
@@ -371,13 +421,13 @@ def wc_fetch_categories(base_url: str, ck: str, cs: str, *, timeout=30, append_l
     per_page = 100
     page = 1
     out = []
-    retries = 4
+    retries = 5
 
     while True:
         if append_log:
             append_log(f"API: categories page {page}…")
         if set_progress:
-            set_progress(min(0.35, 0.08 + page * 0.02))
+            set_progress(min(0.30, 0.05 + page * 0.02))
 
         params = {
             "consumer_key": ck,
@@ -412,6 +462,7 @@ def wc_fetch_categories(base_url: str, ck: str, cs: str, *, timeout=30, append_l
         if last_exc is not None:
             return out
 
+
 def build_category_paths(categories: list[dict]):
     by_id = {}
     for c in categories:
@@ -430,7 +481,7 @@ def build_category_paths(categories: list[dict]):
     def resolve(cid: int, depth=0):
         if cid in paths:
             return paths[cid]
-        if depth > 12:
+        if depth > 18:
             return []
         node = by_id.get(cid)
         if not node:
@@ -447,120 +498,199 @@ def build_category_paths(categories: list[dict]):
 
     for cid in list(by_id.keys()):
         resolve(cid)
+
     return paths
+
 
 def category_path_to_str(path: list[str]) -> str:
     return " > ".join([p for p in path if p])
+
 
 def wc_fetch_products_resumable(
     base_url: str,
     ck: str,
     cs: str,
     *,
-    include_unpublished: bool,
-    cache_file: Path,
+    include_private_fetch: bool,
     resume: bool,
-    per_page=25,
-    timeout=30,
+    timeout: int,
+    per_page: int = 25,
     append_log=None,
     set_progress=None,
     set_count=None,
 ):
+    """Fetch products in two phases (publish then private). No status=any."""
     if not (base_url and ck and cs):
         raise RuntimeError("Woo API secrets missing. Set WC_URL, WC_CK, WC_CS in Streamlit Secrets.")
 
     base_url = base_url.rstrip("/")
     endpoint = f"{base_url}/wp-json/wc/v3/products"
     session = requests.Session()
+
+    state = cache_load_products() if resume else {
+        "fetched_at": "",
+        "in_progress": False,
+        "phase": "publish",
+        "next_page": 1,
+        "include_private_fetch": include_private_fetch,
+        "data": [],
+    }
+
+    # If the user changed include_private_fetch, starting fresh is safest
+    if resume and bool(state.get("include_private_fetch")) != bool(include_private_fetch):
+        if append_log:
+            append_log("Fetch settings changed (private fetch). Starting fresh import.")
+        state = {
+            "fetched_at": "",
+            "in_progress": False,
+            "phase": "publish",
+            "next_page": 1,
+            "include_private_fetch": include_private_fetch,
+            "data": [],
+        }
+        cache_save_products({**state, "in_progress": True})
+
+    out = state.get("data", []) or []
+    phase = state.get("phase", "publish") or "publish"
+    page = int(state.get("next_page", 1) or 1)
+
+    # De-dupe
+    seen_ids = set()
+    for p in out:
+        pid = p.get("id")
+        if pid is not None:
+            seen_ids.add(pid)
+
+    phases = ["publish"]
+    if include_private_fetch:
+        phases.append("private")
+
+    # If cache had finished publish and moved to private, keep that
+    start_phase_index = phases.index(phase) if phase in phases else 0
+
+    cache_save_products({
+        "in_progress": True,
+        "phase": phase,
+        "next_page": page,
+        "include_private_fetch": include_private_fetch,
+        "data": out,
+    })
+
     retries = 8
 
-    status_value = "any" if include_unpublished else "publish"
+    for phase_index in range(start_phase_index, len(phases)):
+        status_value = phases[phase_index]
+        if phase_index != start_phase_index:
+            page = 1  # new phase begins at page 1
 
-    state = progress_cache_load(cache_file) if resume else {"data": [], "in_progress": False, "next_page": 1, "fetched_at": ""}
-    out = state["data"]
-    page = state["next_page"] or 1
-    was_in_progress = bool(state.get("in_progress"))
+        while True:
+            if append_log:
+                append_log(f"API: products page {page} (status={status_value})…")
+            if set_progress:
+                # only a visual hint; not exact
+                base = 0.05 if status_value == "publish" else 0.55
+                set_progress(min(0.95, base + page * 0.01))
 
-    if append_log:
-        if resume and was_in_progress and out:
-            append_log(f"RESUME: continuing import from page {page} (already have {len(out)} products).")
-        else:
-            append_log("Starting import…")
+            params = {
+                "consumer_key": ck,
+                "consumer_secret": cs,
+                "per_page": per_page,
+                "page": page,
+                "status": status_value,
+            }
 
-    progress_cache_save(cache_file, data=out, in_progress=True, next_page=page)
+            last_exc = None
+            for attempt in range(retries + 1):
+                if attempt > 0:
+                    time.sleep(min(0.8 * (2 ** (attempt - 1)), 20.0))
+                try:
+                    r = session.get(endpoint, params=params, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
 
-    while True:
-        if append_log:
-            append_log(f"API: products page {page} (status={status_value})…")
-        if set_progress:
-            set_progress(min(0.88, 0.05 + (page * 0.01)))
+                    if r.status_code in (401, 403):
+                        try:
+                            j = r.json()
+                            raise RuntimeError(f"{j.get('code')} ({r.status_code}): {j.get('message')}")
+                        except Exception:
+                            raise RuntimeError(f"Unauthorized ({r.status_code}). Check Woo REST API permissions.")
 
-        params = {
-            "consumer_key": ck,
-            "consumer_secret": cs,
-            "per_page": per_page,
-            "page": page,
-            "status": status_value,
-        }
+                    if r.status_code >= 500:
+                        last_exc = RuntimeError(f"Server error ({r.status_code}) on page {page} ({status_value})")
+                        continue
 
-        last_exc = None
-        for attempt in range(retries + 1):
-            if attempt > 0:
-                time.sleep(min(0.8 * (2 ** (attempt - 1)), 20.0))
-            try:
-                r = session.get(endpoint, params=params, timeout=timeout, headers={"User-Agent": "bkosher-catalog/1.0"})
-                if r.status_code in (401, 403):
-                    try:
-                        j = r.json()
-                        raise RuntimeError(f"{j.get('code')} ({r.status_code}): {j.get('message')}")
-                    except Exception:
-                        raise RuntimeError(f"Unauthorized ({r.status_code}). Check Woo REST API permissions.")
-                if r.status_code >= 400:
-                    raise RuntimeError(f"API request failed ({r.status_code}) at {sanitize_url(r.url)}")
+                    if r.status_code >= 400:
+                        raise RuntimeError(f"API request failed ({r.status_code}) for status={status_value} page={page}")
 
-                batch = r.json()
+                    batch = r.json()
 
-                if not batch:
-                    if append_log:
-                        append_log("API: no more products.")
-                    progress_cache_save(cache_file, data=out, in_progress=False, next_page=1)
-                    if set_progress:
-                        set_progress(1.0)
-                    return out
+                    if not batch:
+                        # phase finished
+                        break
 
-                out.extend(batch)
-                if set_count:
-                    set_count(len(out))
+                    for item in batch:
+                        pid = item.get("id")
+                        if pid is None or pid not in seen_ids:
+                            out.append(item)
+                            if pid is not None:
+                                seen_ids.add(pid)
 
-                # Save after EVERY PAGE (resume)
-                progress_cache_save(cache_file, data=out, in_progress=True, next_page=page + 1)
+                    if set_count:
+                        set_count(len(out))
 
-                if len(batch) < per_page:
-                    if append_log:
-                        append_log(f"API: complete ({len(out)} products).")
-                    progress_cache_save(cache_file, data=out, in_progress=False, next_page=1)
-                    if set_progress:
-                        set_progress(1.0)
-                    return out
+                    # Save progress after every page
+                    cache_save_products({
+                        "in_progress": True,
+                        "phase": status_value,
+                        "next_page": page + 1,
+                        "include_private_fetch": include_private_fetch,
+                        "data": out,
+                    })
 
-                page += 1
-                last_exc = None
-                break
+                    # end phase if short page
+                    if len(batch) < per_page:
+                        break
 
-            except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                last_exc = e
-                continue
+                    page += 1
+                    last_exc = None
+                    break
 
-        if last_exc is not None:
-            progress_cache_save(cache_file, data=out, in_progress=True, next_page=page)
-            raise RuntimeError(
-                "API import interrupted by repeated SSL/connection errors.\n"
-                "Your progress was saved and will resume next time.\n"
-                f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
-            )
+                except (requests.exceptions.SSLError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                    last_exc = e
+                    continue
+
+            if last_exc is not None:
+                # Save point to resume
+                cache_save_products({
+                    "in_progress": True,
+                    "phase": status_value,
+                    "next_page": page,
+                    "include_private_fetch": include_private_fetch,
+                    "data": out,
+                })
+                raise RuntimeError(
+                    "API import interrupted by repeated connection/server errors.\n"
+                    "Progress was saved and will resume next time.\n"
+                    f"Details: {type(last_exc).__name__}: {str(last_exc)[:200]}"
+                )
+
+            # no batch or short batch -> phase done
+            if append_log:
+                append_log(f"API: phase {status_value} complete.")
+            break
+
+    cache_save_products({
+        "in_progress": False,
+        "phase": "publish",
+        "next_page": 1,
+        "include_private_fetch": include_private_fetch,
+        "data": out,
+    })
+    if set_progress:
+        set_progress(1.0)
+    return out
+
 
 # ============================
-# NORMALIZE PRODUCTS
+# NORMALIZE PRODUCTS (parent category selection FIX)
 # ============================
 def wc_to_product(p: dict, cat_paths: dict[int, list[str]]):
     cat_ids = []
@@ -575,16 +705,33 @@ def wc_to_product(p: dict, cat_paths: dict[int, list[str]]):
         if n:
             cat_names.append(n)
 
-    best_path = []
+    # Build ALL full category paths
+    full_paths = []
     for cid in cat_ids:
-        path = cat_paths.get(cid) or []
-        if len(path) > len(best_path):
-            best_path = path
+        path_list = cat_paths.get(cid) or []
+        if path_list:
+            full_paths.append(category_path_to_str(path_list))
 
-    if not best_path and cat_names:
-        best_path = [cat_names[0]]
-    cat_path_str = category_path_to_str(best_path) if best_path else "Other"
+    # Fallback (rare)
+    if not full_paths and cat_names:
+        full_paths = [cat_names[0]]
 
+    # Expand parent segments
+    expanded = set()
+    for full in full_paths:
+        parts = [x.strip() for x in full.split(">")]
+        parts = [x for x in parts if x]
+        for i in range(1, len(parts) + 1):
+            expanded.add(" > ".join(parts[:i]))
+
+    category_paths = sorted(expanded, key=lambda s: s.lower())
+
+    # Primary grouping path (deepest)
+    primary_path = "Other"
+    if full_paths:
+        primary_path = max(full_paths, key=lambda s: len(s.split(">")))
+
+    # Attributes
     attrs = []
     for a in (p.get("attributes") or []):
         n = safe_text(a.get("name"))
@@ -611,7 +758,8 @@ def wc_to_product(p: dict, cat_paths: dict[int, list[str]]):
         "status": status,
         "name": safe_text(p.get("name")),
         "sku": safe_text(p.get("sku")),
-        "category_path": cat_path_str,
+        "category_path": primary_path,         # grouping label
+        "category_paths": category_paths,      # for filtering (parent works!)
         "categories_flat": cat_names,
         "short_desc": strip_html(p.get("short_description") or ""),
         "regular_price": reg,
@@ -624,9 +772,10 @@ def wc_to_product(p: dict, cat_paths: dict[int, list[str]]):
         "_image_path": None,
     }
 
+
 def load_products_and_categories(
     *,
-    include_unpublished: bool,
+    include_private_fetch: bool,
     timeout: int,
     force_refresh: bool,
     resume: bool,
@@ -634,35 +783,31 @@ def load_products_and_categories(
     set_progress=None,
     set_count=None,
 ):
-    products_cache = API_PRODUCTS_ANY if include_unpublished else API_PRODUCTS_PUBLISH
-
-    cat_raw, cat_at = simple_cache_load(API_CATEGORIES_CACHE)
+    cat_raw, cat_at = cache_load_categories()
     if cat_raw is None or force_refresh:
         if append_log:
             append_log("Loading category hierarchy…")
         cat_raw = wc_fetch_categories(WC_URL, WC_CK, WC_CS, timeout=timeout, append_log=append_log, set_progress=set_progress) or []
-        simple_cache_save(API_CATEGORIES_CACHE, cat_raw)
+        cache_save_categories(cat_raw)
         cat_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cat_paths = build_category_paths(cat_raw or [])
 
-    if not force_refresh and not resume:
-        state = progress_cache_load(products_cache)
-        if state["data"] and not state["in_progress"]:
+    # If not forcing refresh, and cache is complete, use it
+    if not force_refresh and resume:
+        state = cache_load_products()
+        if state.get("data") and not state.get("in_progress"):
             if append_log:
-                append_log(f"Loaded {len(state['data'])} products from complete cache ({state['fetched_at']}).")
+                append_log(f"Loaded {len(state['data'])} products from completed cache ({state['fetched_at']}).")
             normalized = [wc_to_product(x, cat_paths) for x in state["data"]]
             return normalized, state["fetched_at"], "disk_cache", cat_at
 
     raw = wc_fetch_products_resumable(
-        WC_URL,
-        WC_CK,
-        WC_CS,
-        include_unpublished=include_unpublished,
-        cache_file=products_cache,
+        WC_URL, WC_CK, WC_CS,
+        include_private_fetch=include_private_fetch,
         resume=resume,
-        per_page=25,
         timeout=timeout,
+        per_page=25,
         append_log=append_log,
         set_progress=set_progress,
         set_count=set_count,
@@ -671,8 +816,9 @@ def load_products_and_categories(
     normalized = [wc_to_product(x, cat_paths) for x in raw]
     return normalized, fetched_at, "api_or_resume", cat_at
 
+
 # ============================
-# CSV (backup)
+# CSV BACKUP
 # ============================
 def read_csv_rows(uploaded_file):
     b = uploaded_file.getvalue()
@@ -682,12 +828,14 @@ def read_csv_rows(uploaded_file):
         text = b.decode("latin-1", errors="replace")
     return list(csv.DictReader(io.StringIO(text)))
 
+
 def best_key(keys, candidates):
     lower = {k.lower(): k for k in keys}
     for c in candidates:
         if c.lower() in lower:
             return lower[c.lower()]
     return None
+
 
 def csv_to_products(rows, base_url: str):
     if not rows:
@@ -704,7 +852,6 @@ def csv_to_products(rows, base_url: str):
     col_imgs = best_key(keys, ["Images", "Image", "Image URLs"])
     col_url = best_key(keys, ["Permalink", "Product URL", "URL", "Link"])
     col_stock = best_key(keys, ["Stock status", "Stock Status", "stock_status"])
-    col_slug = best_key(keys, ["Slug", "slug"])
     col_status = best_key(keys, ["Status", "Post status", "Visibility", "Published"])
 
     products = []
@@ -730,7 +877,18 @@ def csv_to_products(rows, base_url: str):
         cats_flat = []
         if col_cats:
             cats_flat = [c.strip() for c in safe_text(row.get(col_cats)).split(",") if c.strip()]
-        cat_path = cats_flat[0] if cats_flat else "Other"
+        primary = cats_flat[0] if cats_flat else "Other"
+
+        # Expand parent segments from a single string if possible
+        expanded = set()
+        if primary and ">" in primary:
+            parts = [x.strip() for x in primary.split(">") if x.strip()]
+            for i in range(1, len(parts) + 1):
+                expanded.add(" > ".join(parts[:i]))
+        elif primary:
+            expanded.add(primary)
+
+        category_paths = sorted(expanded, key=lambda s: s.lower())
 
         image_urls = []
         if col_imgs:
@@ -747,10 +905,6 @@ def csv_to_products(rows, base_url: str):
             pid = safe_text(row.get(col_id)) if col_id else ""
             if pid.isdigit():
                 url = f"{base_url.rstrip('/')}/?post_type=product&p={pid}"
-            else:
-                slug = safe_text(row.get(col_slug)) if col_slug else ""
-                if slug:
-                    url = f"{base_url.rstrip('/')}/{slug.lstrip('/')}"
 
         status = safe_text(row.get(col_status)) if col_status else ""
         status_l = status.lower()
@@ -759,29 +913,20 @@ def csv_to_products(rows, base_url: str):
         elif "publish" in status_l or "public" in status_l or status_l == "1":
             status = "publish"
 
-        attrs = []
-        for i in range(1, 21):
-            ncol = f"Attribute {i} name"
-            vcol = f"Attribute {i} value(s)"
-            if ncol in row and vcol in row:
-                n = safe_text(row.get(ncol))
-                v = safe_text(row.get(vcol))
-                if n and v:
-                    attrs.append((n, v))
-
         products.append(
             {
                 "id": safe_text(row.get(col_id)) if col_id else "",
                 "status": status,
                 "name": name,
                 "sku": sku,
-                "category_path": cat_path,
+                "category_path": primary,
+                "category_paths": category_paths or ([primary] if primary else ["Other"]),
                 "categories_flat": cats_flat,
                 "short_desc": desc,
                 "regular_price": reg,
                 "sale_price": sale,
                 "on_sale": bool(on_sale),
-                "attributes": attrs,
+                "attributes": [],
                 "url": url,
                 "stock_status": stock_status,
                 "_image_urls": image_urls,
@@ -791,29 +936,31 @@ def csv_to_products(rows, base_url: str):
 
     return products
 
-# ============================
-# CATEGORY PICKER (parent + child)
-# ============================
-def build_category_tree_options(category_paths: list[str]) -> list[str]:
-    out = set()
-    for p in category_paths:
-        p = safe_text(p)
-        if not p:
-            continue
-        parts = [x.strip() for x in p.split(">")]
-        parts = [x for x in parts if x]
-        for i in range(1, len(parts) + 1):
-            out.add(" > ".join(parts[:i]))
-    return sorted(out, key=lambda s: s.lower())
 
-def category_match(product_path: str, selected: set[str]) -> bool:
-    product_path = safe_text(product_path) or "Other"
-    if product_path in selected:
-        return True
-    for sel in selected:
-        if product_path.startswith(sel + " > "):
-            return True
+# ============================
+# CATEGORY OPTIONS (parent selectable)
+# ============================
+def build_category_options_from_products(products: list[dict]) -> list[str]:
+    all_paths = set()
+    for p in products:
+        for cp in (p.get("category_paths") or []):
+            cp = safe_text(cp)
+            if cp:
+                all_paths.add(cp)
+    return sorted(all_paths, key=lambda s: s.lower())
+
+
+def product_matches_selected_categories(p: dict, selected: set[str]) -> bool:
+    paths = p.get("category_paths") or []
+    for pp in paths:
+        pp = safe_text(pp)
+        if not pp:
+            continue
+        for sel in selected:
+            if pp == sel or pp.startswith(sel + " > "):
+                return True
     return False
+
 
 # ============================
 # PDF
@@ -863,6 +1010,7 @@ class CatalogPDF(FPDF):
         self.set_xy(12, y + 2)
         self.cell(0, 8, f"{self.brand_site} | {self.disclaimer}")
 
+
 def group_products_by_category_path(products):
     groups = {}
     for p in products:
@@ -874,6 +1022,7 @@ def group_products_by_category_path(products):
         items.sort(key=lambda p: safe_text(p.get("name")).lower())
         out.append((k, items))
     return out
+
 
 def make_catalog_pdf_bytes(
     products,
@@ -888,7 +1037,7 @@ def make_catalog_pdf_bytes(
     show_attrs: bool,
     exclude_oos: bool,
     only_sale: bool,
-    include_private: bool,
+    include_private_in_catalog: bool,
 ):
     today_str = datetime.date.today().strftime("%d %b %Y")
     disclaimer = pdf_safe(f"Prices correct as of {today_str}")
@@ -905,10 +1054,11 @@ def make_catalog_pdf_bytes(
         format="A4",
     )
 
+    # Final filter pass for PDF
     working = []
     for p in products:
         status = safe_text(p.get("status")).lower()
-        if (not include_private) and status == "private":
+        if (not include_private_in_catalog) and status == "private":
             continue
         if exclude_oos and safe_text(p.get("stock_status")).lower() == "outofstock":
             continue
@@ -924,9 +1074,7 @@ def make_catalog_pdf_bytes(
     category_bar_h = 10
     gutter = 5 if grid_mode == "Compact" else 6
 
-    # Grid rules:
-    # Portrait: Standard 3x3, Compact 6x6
-    # Landscape: Standard 4x3, Compact 8x4  (fits better)
+    # Grid rules (auto-adjust for landscape)
     if orientation == "Portrait":
         cols, rows = (6, 6) if grid_mode == "Compact" else (3, 3)
     else:
@@ -940,7 +1088,7 @@ def make_catalog_pdf_bytes(
     blue_rgb = hex_to_rgb(BRAND_BLUE_HEX)
     red_rgb = hex_to_rgb(BRAND_RED_HEX)
 
-    # Contents page
+    # Contents
     pdf.add_page()
     pdf.set_text_color(*blue_rgb)
     pdf.set_font("Helvetica", "B", 20)
@@ -977,7 +1125,6 @@ def make_catalog_pdf_bytes(
         pdf.set_text_color(17, 24, 39)
         y += 8
 
-    # Helper: draw with bottom clamp (prevents overflow)
     def draw_lines_clamped(x, y, bottom_y, line_h, lines, font_setter):
         cy = y
         for ln in lines:
@@ -998,7 +1145,7 @@ def make_catalog_pdf_bytes(
         while idx < len(items):
             pdf.add_page()
 
-            # Category divider bar
+            # Category divider bar (brand colour)
             pdf.set_fill_color(*blue_rgb)
             bar_y = header_space
             pdf.rect(margin, bar_y, pdf.w - 2 * margin, category_bar_h, style="F")
@@ -1066,13 +1213,13 @@ def make_catalog_pdf_bytes(
                     ycur = img_y + img_h + 2
                     bottom = yy + card_h - pad
 
-                    # Fonts (compact uses smaller)
+                    # Fonts
                     name_fs = 7.2 if grid_mode == "Compact" else 9.5
                     price_fs = 7.8 if grid_mode == "Compact" else 10
                     meta_fs = 6.0 if grid_mode == "Compact" else 8.5
                     desc_fs = 5.6 if grid_mode == "Compact" else 7.6
 
-                    # NAME: max 2 lines
+                    # NAME (max 2 lines)
                     def set_name_font():
                         pdf.set_text_color(0, 0, 0)
                         pdf.set_font("Helvetica", "B", name_fs)
@@ -1114,7 +1261,7 @@ def make_catalog_pdf_bytes(
 
                         pdf.set_text_color(0, 0, 0)
 
-                    # SKU: max 1 line
+                    # SKU (max 1 line)
                     if show_sku and ycur + 3.6 <= bottom:
                         sku = safe_text(p.get("sku"))
                         if sku:
@@ -1125,7 +1272,7 @@ def make_catalog_pdf_bytes(
                             pdf.cell(0, 3.6, pdf_safe(line))
                             ycur += 3.8
 
-                    # ATTRS: max 2 lines
+                    # ATTRS (max 2 lines)
                     if show_attrs and ycur + 3.6 <= bottom:
                         attrs = p.get("attributes") or []
                         if attrs:
@@ -1147,7 +1294,7 @@ def make_catalog_pdf_bytes(
                                 ycur += 3.7
                                 shown += 1
 
-                    # DESC: Compact max 1 line, Standard max 2
+                    # DESC (clamped)
                     if show_desc and ycur + 3.2 <= bottom:
                         desc = strip_html(p.get("short_desc"))
                         if desc:
@@ -1162,8 +1309,8 @@ def make_catalog_pdf_bytes(
 
                     xx += card_w + gutter
 
-    out = pdf.output()
-    return strict_bytes(out)
+    return strict_bytes(pdf.output())
+
 
 # ============================
 # APP STATE
@@ -1179,27 +1326,31 @@ if "products_filtered" not in st.session_state:
 if "_settings" not in st.session_state:
     st.session_state._settings = {}
 
+
 # ============================
 # SIDEBAR
 # ============================
 with st.sidebar:
     st.caption(f"App version: **{APP_VERSION}**")
+
     try:
-        st.image(LOGO_PNG_PATH, width=190)
+        st.image(LOGO_PNG_PATH, width=200)
     except Exception:
-        st.warning("Logo missing. Upload Bkosher.png to repo root.")
+        st.warning(f"Logo missing. Upload '{LOGO_PNG_PATH}' to repo root.")
 
     if WC_URL and WC_CK and WC_CS:
         st.success("Woo API configured")
     else:
         st.error("Woo API secrets missing (WC_URL / WC_CK / WC_CS)")
 
-    pub_state = progress_cache_load(API_PRODUCTS_PUBLISH)
-    any_state = progress_cache_load(API_PRODUCTS_ANY)
-    if pub_state["data"]:
-        st.info(f"Cache publish: {len(pub_state['data']):,} • in_progress={pub_state['in_progress']} • next_page={pub_state['next_page']}")
-    if any_state["data"]:
-        st.info(f"Cache any: {len(any_state['data']):,} • in_progress={any_state['in_progress']} • next_page={any_state['next_page']}")
+    state = cache_load_products()
+    if state.get("data"):
+        st.info(
+            f"Cache: {len(state['data']):,} products "
+            f"• in_progress={state['in_progress']} "
+            f"• phase={state['phase']} "
+            f"• next_page={state['next_page']}"
+        )
 
     if st.button("Logout"):
         st.session_state.authenticated = False
@@ -1210,9 +1361,16 @@ with st.sidebar:
             del st.session_state[k]
         st.rerun()
 
+
+# ============================
+# MAIN UI
+# ============================
 st.title("Customer Catalog Builder")
 st.caption("Default = WooCommerce API. CSV upload is a backup option.")
-st.markdown("<div class='bk_hint'>API imports are resumable — if Cloud crashes, next run continues where it stopped.</div>", unsafe_allow_html=True)
+st.markdown(
+    "<div class='bk_hint'>API imports are resumable — if Streamlit Cloud restarts, the next run continues from where it stopped.</div>",
+    unsafe_allow_html=True,
+)
 
 # ============================
 # STEP 1 — SOURCE
@@ -1233,22 +1391,22 @@ if st.session_state.step >= 2:
     if data_source == "WooCommerce API":
         api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
 
-        include_unpublished = st.checkbox(
-            "Fetch unpublished/private products (requires API permission)",
+        include_private_fetch = st.checkbox(
+            "Fetch PRIVATE (unpublished) products as well",
             value=False,
-            help="This controls what we fetch. You can hide/show private in Step 3.",
+            help="This fetches private products in a separate pass (no status=any). You can still exclude them from the catalog in Step 3.",
         )
 
         resume_import = st.checkbox(
             "Resume import if previously interrupted",
             value=True,
-            help="If the app crashed before finishing, continues from the last saved page instead of restarting.",
+            help="If Cloud crashed mid-import, continue from the last saved page instead of restarting.",
         )
 
         c1, c2, c3 = st.columns(3)
         load_btn = c1.button("Load (resume/cache)")
         refresh_btn = c2.button("Start fresh (delete progress + reimport)")
-        clear_img_cache = c3.button("Clear image cache (optional)")
+        clear_img_cache = c3.button("Clear image cache")
 
         if clear_img_cache:
             try:
@@ -1258,13 +1416,8 @@ if st.session_state.step >= 2:
             except Exception:
                 st.warning("Could not clear some cached images.")
 
-        products_cache = API_PRODUCTS_ANY if include_unpublished else API_PRODUCTS_PUBLISH
-
         if refresh_btn:
-            try:
-                products_cache.unlink(missing_ok=True)
-            except Exception:
-                pass
+            cache_clear_products()
             st.success("Progress cleared. Now press Load.")
             st.stop()
 
@@ -1293,7 +1446,7 @@ if st.session_state.step >= 2:
                 status.info("Loading products (resumable)…")
 
                 products, fetched_at, source, cat_at = load_products_and_categories(
-                    include_unpublished=bool(include_unpublished),
+                    include_private_fetch=bool(include_private_fetch),
                     timeout=int(api_timeout),
                     force_refresh=False,
                     resume=bool(resume_import),
@@ -1343,7 +1496,7 @@ if st.session_state.step >= 3:
         "Products per page",
         ["Standard (3×3)", "Compact (6×6)"],
         index=0,
-        help="Portrait: Standard=3×3, Compact=6×6. Landscape auto-adjusts to keep cards readable.",
+        help="Portrait: Standard=3×3, Compact=6×6. Landscape auto-adjusts grid to keep cards readable.",
     )
     grid_mode_value = "Compact" if grid_mode.startswith("Compact") else "Standard"
 
@@ -1360,38 +1513,47 @@ if st.session_state.step >= 3:
     exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
     only_sale = st.checkbox("Only sale items", value=False)
 
-    include_private = st.checkbox(
-        "Include PRIVATE products",
+    # ALWAYS visible (your request)
+    include_private_in_catalog = st.checkbox(
+        "Include PRIVATE products in the catalog",
         value=False,
-        help="If you fetched private/unpublished in Step 2, this controls whether they appear in the catalog.",
+        help="If private products were fetched, this shows them in the catalog. Otherwise there are none to show.",
     )
+    private_loaded = sum(1 for p in products if safe_text(p.get("status")).lower() == "private")
+    if private_loaded == 0:
+        st.caption("Private products loaded: 0 (enable private fetching in Step 2 if needed).")
+    else:
+        st.caption(f"Private products loaded: {private_loaded}")
 
-    # Category selection with parents
-    all_product_paths = sorted({safe_text(p.get("category_path")) or "Other" for p in products}, key=lambda s: s.lower())
-    tree_options = build_category_tree_options(all_product_paths)
-
+    # Category selection (PARENTS selectable)
+    tree_options = build_category_options_from_products(products)
     selected_paths = st.multiselect(
-        "Categories (select parent or any subcategory)",
+        "Categories (select a parent like 'Alcohol' to include all its children)",
         tree_options,
         default=[],
-        help="Selecting a parent includes all child/grandchild categories automatically.",
     )
 
     q = st.text_input("Search (name or SKU)", value="").strip().lower()
 
     filtered = products[:]
+
     if selected_paths:
         sset = set(selected_paths)
-        filtered = [p for p in filtered if category_match(safe_text(p.get("category_path")) or "Other", sset)]
+        filtered = [p for p in filtered if product_matches_selected_categories(p, sset)]
+
     if q:
         filtered = [p for p in filtered if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())]
+
     if exclude_oos:
         filtered = [p for p in filtered if safe_text(p.get("stock_status")).lower() != "outofstock"]
+
     if only_sale:
         filtered = [p for p in filtered if bool(p.get("on_sale"))]
-    if not include_private:
+
+    if not include_private_in_catalog:
         filtered = [p for p in filtered if safe_text(p.get("status")).lower() != "private"]
 
+    # Sort by deepest category path
     filtered.sort(key=lambda p: ((safe_text(p.get("category_path")) or "Other").lower(), safe_text(p.get("name")).lower()))
     st.session_state.products_filtered = filtered
 
@@ -1411,7 +1573,7 @@ if st.session_state.step >= 3:
             "show_attrs": bool(show_attrs),
             "exclude_oos": bool(exclude_oos),
             "only_sale": bool(only_sale),
-            "include_private": bool(include_private),
+            "include_private_in_catalog": bool(include_private_in_catalog),
         }
         st.rerun()
 
@@ -1425,7 +1587,7 @@ if st.session_state.step >= 4:
 
     preset = settings.get("preset", "Reliable")
 
-    # Cloud-safe cap to reduce freezes / health-check 503s
+    # Cloud-safe caps (reduces health-check 503 hangs)
     cloud_cap = 4
     if preset == "Reliable":
         dl_workers, dl_retries, dl_timeout, dl_backoff = 4, 10, 25, 0.9
@@ -1492,7 +1654,7 @@ if st.session_state.step >= 4:
         show_attrs=bool(settings.get("show_attrs", True)),
         exclude_oos=bool(settings.get("exclude_oos", True)),
         only_sale=bool(settings.get("only_sale", False)),
-        include_private=bool(settings.get("include_private", False)),
+        include_private_in_catalog=bool(settings.get("include_private_in_catalog", False)),
     )
 
     pdf_bytes = strict_bytes(pdf_bytes)
@@ -1507,4 +1669,4 @@ if st.session_state.step >= 4:
         mime="application/pdf",
     )
 
-    st.caption("Tip: On iPhone, backgrounding the tab can pause the session — but API import progress is saved and will resume next time.")
+    st.caption("Note: On iPhone, backgrounding the browser can pause the session. Imports are resumable and continue next run.")
