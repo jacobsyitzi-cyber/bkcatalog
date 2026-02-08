@@ -1538,7 +1538,11 @@ if st.session_state.step >= 2:
 if st.session_state.step >= 3:
     st.subheader("Step 3 — Filters & layout")
     products = st.session_state.products_raw
-
+# --- Loaded counts (debug/visibility) ---
+total_count = len(products)
+private_count = sum(1 for p in products if safe_text(p.get("status")).lower() == "private")
+oos_count = sum(1 for p in products if safe_text(p.get("stock_status")).lower() == "outofstock")
+st.caption(f"Loaded: {total_count:,} | Private: {private_count:,} | Out-of-stock: {oos_count:,}")
     title = st.text_input("Catalog title", value=DEFAULT_TITLE)
     orientation = st.selectbox("Page orientation", ["Portrait", "Landscape"], index=0)
 
@@ -1595,14 +1599,31 @@ if st.session_state.step >= 3:
             if (q in safe_text(p.get("name")).lower()) or (q in safe_text(p.get("sku")).lower())
         ]
 
-    if exclude_oos:
-        filtered = [p for p in filtered if safe_text(p.get("stock_status")).lower() != "outofstock"]
+    # --- Filters ---
+exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
+only_sale = st.checkbox("Only sale items", value=False)
 
-    if only_sale:
-        filtered = [p for p in filtered if bool(p.get("on_sale"))]
+include_private_in_catalog = st.checkbox(
+    "Include PRIVATE (unpublished) products in the catalog/PDF",
+    value=False,
+    help="Private items must also be fetched in Step 2 (requires API permission).",
+)
 
-    if not include_private_in_pdf:
-        filtered = [p for p in filtered if safe_text(p.get("status")).lower() != "private"]
+# Apply filters
+if exclude_oos:
+    filtered = [p for p in filtered if safe_text(p.get("stock_status")).lower() != "outofstock"]
+
+if only_sale:
+    filtered = [p for p in filtered if bool(p.get("on_sale"))]
+
+if not include_private_in_catalog:
+    filtered = [p for p in filtered if safe_text(p.get("status")).lower() != "private"]
+
+# Show what got removed
+after_count = len(filtered)
+removed_private = 0 if include_private_in_catalog else private_count
+removed_oos = oos_count if exclude_oos else 0
+st.caption(f"Selected: {after_count:,} (removed private: {removed_private:,} | removed out-of-stock: {removed_oos:,})")
 
     # Sort by category (deep path) then product name
     filtered.sort(key=lambda p: ((safe_text(p.get("category_path")) or "Other").lower(), safe_text(p.get("name")).lower()))
