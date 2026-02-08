@@ -1,17 +1,29 @@
-# app.py — B-Kosher Catalog Builder (API default)
-# - WooCommerce API or CSV upload
-# - Parent category selection includes children
-# - Optional include private/unpublished (API permission required)
-# - Grid densities: Standard (3x3), Compact (6x5) to prevent overflow
-# - PDF via fpdf2 (no reportlab), safe bytes output for Streamlit download
-# - Live progress + logs, reliable image downloader with retries
+# app.py — B-Kosher Catalog Builder (Streamlit)
+# - Default source: WooCommerce API (secrets)
+# - Backup source: CSV upload
+# - Customer-facing login (password stored in Streamlit secrets)
+# - Builds printable PDF catalog (FPDF2) with branding + clickable product links
+# - Robust API fetch with resume checkpoints + disk cache (prevents restarts on iPhone/background)
+# - Grid presets: Standard (3×3) + Compact (6×5) + others
+# - Parent category selection supported (select Alcohol and it includes Alcohol > Beer, etc.)
+# - Optional: include/exclude private products in the PDF (and in API fetch if API user permits)
+#
+# REQUIRED SECRETS (Streamlit Cloud -> App -> Settings -> Secrets):
+# APP_PASSWORD = "...."
+# WC_STORE_URL = "https://www.b-kosher.co.uk"
+# WC_CONSUMER_KEY = "ck_...."
+# WC_CONSUMER_SECRET = "cs_...."
+#
+# requirements.txt (recommended):
+# streamlit==1.31.1
+# requests==2.31.0
+# pandas==2.2.2
+# pillow==10.4.0
+# fpdf2==2.7.9
 
 from __future__ import annotations
 
 import base64
-import concurrent.futures as futures
-import dataclasses
-import datetime as dt
 import hashlib
 import html
 import io
@@ -19,1245 +31,1292 @@ import json
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
+from PIL import Image
+from requests.auth import HTTPBasicAuth
 
-from fpdf import FPDF
-
-try:
-    from PIL import Image
-except Exception:
-    Image = None  # Pillow should be installed via requirements.txt
+from fpdf import FPDF  # fpdf2
 
 
-# =========================
-# Branding
-# =========================
-BRAND_BLUE = (0, 76, 151)   # #004C97
-BRAND_RED = (200, 16, 46)   # #C8102E
+# ----------------------------
+# Branding (B-Kosher)
+# ----------------------------
+BRAND_BLUE = (0, 76, 151)     # #004C97
+BRAND_RED = (200, 16, 46)     # #C8102E
 BRAND_SITE = "www.b-kosher.co.uk"
 DEFAULT_TITLE = "B-Kosher Product Catalog"
 
-LOGO_FILE_CANDIDATES = [
-    "Bkosher.png",                    # what you currently have in repo
-    "B-kosher logo high q.png",        # what you said your file is called
-    "bkosher.svg",
+# File in repo (you said your repo has Bkosher.png)
+LOGO_FILENAME_CANDIDATES = [
+    "Bkosher.png",
+    "B-kosher logo high q.png",
+    "bkosher.svg",  # if you still have it
 ]
 
-SESSION_CACHE_KEY = "products_df_v1"
+# Cache locations (Streamlit Cloud allows /tmp)
+APP_CACHE_DIR = os.path.join("/tmp", "bkcatalog_cache")
+IMG_CACHE_DIR = os.path.join(APP_CACHE_DIR, "images")
+CHKPT_DIR = os.path.join(APP_CACHE_DIR, "checkpoints")
+os.makedirs(IMG_CACHE_DIR, exist_ok=True)
+os.makedirs(CHKPT_DIR, exist_ok=True)
 
 
-# =========================
-# Helpers
-# =========================
-def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
-    return "#{:02X}{:02X}{:02X}".format(*rgb)
+# ----------------------------
+# Utility helpers
+# ----------------------------
+def now_str() -> str:
+    return datetime.now().strftime("%d %b %Y")
 
 
-def now_date_str() -> str:
-    return dt.datetime.now().strftime("%d %b %Y")
-
-
-def safe_text(s: Any) -> str:
-    """Cleans text for PDF core fonts (latin-1) and UI.
-    - Converts HTML entities (&amp; -> &)
-    - Removes 'nan'
-    - Replaces unsupported chars
-    """
+def safe_unescape(s: Any) -> str:
+    """Turn '&amp;' into '&' and drop NaN/None to ''."""
     if s is None:
         return ""
     if isinstance(s, float) and pd.isna(s):
         return ""
     s = str(s)
-    if s.lower() == "nan":
+    if s.strip().lower() == "nan":
         return ""
-    s = html.unescape(s)  # handles &amp; etc
-    s = s.replace("\u00a0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return html.unescape(s)
 
 
-def pdf_safe_latin1(s: str) -> str:
-    """Ensure text doesn't crash fpdf2 with unicode encoding exceptions."""
-    s = safe_text(s)
-    # Replace some common offenders
-    s = s.replace("•", "-").replace("–", "-").replace("—", "-").replace("’", "'").replace("“", '"').replace("”", '"')
-    # Strip remaining non-latin-1 characters
-    return s.encode("latin-1", "ignore").decode("latin-1", "ignore")
-
-
-def fmt_price(x: Any, currency: str = "£") -> str:
+def money_fmt(value: Any, currency_symbol: str = "£") -> str:
     try:
-        if x is None:
+        if value is None:
             return ""
-        if isinstance(x, str) and x.strip() == "":
-            return ""
-        val = float(x)
-        return f"{currency}{val:.2f}"
+        if isinstance(value, str):
+            value = value.strip()
+            if value == "":
+                return ""
+        v = float(value)
+        return f"{currency_symbol}{v:.2f}"
     except Exception:
         return ""
-
-
-def is_on_sale(row: pd.Series) -> bool:
-    # Woo API gives on_sale boolean, sale_price, regular_price etc.
-    if "on_sale" in row and bool(row.get("on_sale")):
-        return True
-    sp = row.get("sale_price", "")
-    rp = row.get("regular_price", "")
-    try:
-        return float(sp) > 0 and float(sp) < float(rp)
-    except Exception:
-        return False
-
-
-def pick_logo_bytes() -> Optional[bytes]:
-    for fn in LOGO_FILE_CANDIDATES:
-        if os.path.exists(fn):
-            with open(fn, "rb") as f:
-                return f.read()
-    return None
 
 
 def sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
 
-# =========================
-# WooCommerce API
-# =========================
-@dataclasses.dataclass
-class WooCreds:
-    store_url: str
-    consumer_key: str
-    consumer_secret: str
-    timeout: int = 30
+def redact_url(url: str) -> str:
+    """Remove query params so keys never appear in errors/logs."""
+    return url.split("?")[0]
 
 
-def wc_get(creds: WooCreds, endpoint: str, params: Dict[str, Any]) -> requests.Response:
-    url = creds.store_url.rstrip("/") + endpoint
-    # DO NOT leak keys in errors: never print full url with query
-    params = dict(params)
-    params["consumer_key"] = creds.consumer_key
-    params["consumer_secret"] = creds.consumer_secret
-    r = requests.get(url, params=params, timeout=creds.timeout)
-    return r
-
-
-def fetch_all_categories(creds: WooCreds, log_fn, progress_fn) -> List[Dict[str, Any]]:
-    cats: List[Dict[str, Any]] = []
-    page = 1
-    per_page = 100
-    while True:
-        log_fn(f"API: fetching categories page {page}…")
-        r = wc_get(creds, "/wp-json/wc/v3/products/categories", {
-            "per_page": per_page, "page": page, "hide_empty": "false"
-        })
-        if r.status_code != 200:
-            log_fn(f"API categories failed ({r.status_code}).")
-            break
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            break
-        cats.extend(data)
-        page += 1
-        progress_fn(min(0.25, 0.05 + len(cats) / 5000 * 0.2))
-        if len(data) < per_page:
-            break
-    return cats
-
-
-def fetch_products_by_status(
-    creds: WooCreds,
-    status_value: str,
-    log_fn,
-    progress_fn,
-    resume_state: Optional[dict] = None,
-) -> List[Dict[str, Any]]:
-    """Fetch products by a specific Woo status ('publish', 'private', etc.)"""
-    out: List[Dict[str, Any]] = []
-    per_page = 25  # safer
-    page = 1
-
-    # Resume support within same session
-    if resume_state and resume_state.get("status") == status_value:
-        page = int(resume_state.get("page", 1))
-        out = list(resume_state.get("items", []))
-
-    while True:
-        log_fn(f"API: fetching products page {page} (status={status_value})…")
-        r = wc_get(creds, "/wp-json/wc/v3/products", {
-            "per_page": per_page,
-            "page": page,
-            "status": status_value,
-        })
-        if r.status_code != 200:
-            # Do not show keys — show endpoint + status only
-            log_fn(f"API request failed ({r.status_code}) for products (status={status_value}) page={page}.")
-            try:
-                msg = r.json().get("message", "")
-                if msg:
-                    log_fn(f"API says: {safe_text(msg)}")
-            except Exception:
-                pass
-            break
-
-        data = r.json()
-        if not isinstance(data, list) or len(data) == 0:
-            break
-
-        out.extend(data)
-        page += 1
-
-        # Update resume snapshot
-        st.session_state["api_resume"] = {"status": status_value, "page": page, "items": out}
-
-        # progress is approximate, but gives confidence
-        progress_fn(min(0.85, 0.25 + len(out) / 8000 * 0.6))
-
-        if len(data) < per_page:
-            break
-
-    return out
-
-
-def normalize_products_from_api(products: List[Dict[str, Any]]) -> pd.DataFrame:
-    rows = []
-    for p in products:
-        cats = p.get("categories", []) or []
-        images = p.get("images", []) or []
-        attrs = p.get("attributes", []) or []
-
-        # pick main image
-        img_url = ""
-        if len(images) > 0:
-            img_url = safe_text(images[0].get("src", ""))
-
-        # attributes string
-        attr_parts = []
-        for a in attrs:
-            name = safe_text(a.get("name", ""))
-            opts = a.get("options", []) or []
-            opts = [safe_text(x) for x in opts if safe_text(x)]
-            if name and opts:
-                attr_parts.append(f"{name}: {', '.join(opts)}")
-        attr_text = " | ".join(attr_parts)
-
-        # category ids + names
-        cat_ids = [c.get("id") for c in cats if isinstance(c, dict) and "id" in c]
-        cat_names = [safe_text(c.get("name")) for c in cats if isinstance(c, dict)]
-
-        rows.append({
-            "id": p.get("id"),
-            "name": safe_text(p.get("name", "")),
-            "sku": safe_text(p.get("sku", "")),
-            "permalink": safe_text(p.get("permalink", "")),
-            "status": safe_text(p.get("status", "")),  # publish/private/draft
-            "stock_status": safe_text(p.get("stock_status", "")),  # instock/outofstock/onbackorder
-            "price": safe_text(p.get("price", "")),
-            "regular_price": safe_text(p.get("regular_price", "")),
-            "sale_price": safe_text(p.get("sale_price", "")),
-            "on_sale": bool(p.get("on_sale", False)),
-            "short_description": safe_text(p.get("short_description", "")),
-            "description": safe_text(p.get("description", "")),
-            "brand": safe_text((p.get("brands") or "")),  # if plugin returns it
-            "image_url": img_url,
-            "category_ids": cat_ids,
-            "category_names": cat_names,
-            "attributes": attr_text,
-        })
-    df = pd.DataFrame(rows)
-
-    # Brand / Kashrus often come through as attributes; we’ll try to detect common names
-    # If you have specific attribute names (e.g. "Kashrus") this will help show it.
-    # Keep as-is; you can refine later.
-    return df
-
-
-# =========================
-# CSV loading
-# =========================
-def load_products_from_csv(file_bytes: bytes) -> pd.DataFrame:
-    df = pd.read_csv(io.BytesIO(file_bytes), dtype=str, keep_default_na=False)
-    # Attempt to map Woo export columns
-    colmap_candidates = {
-        "name": ["Name", "Product name", "Title"],
-        "sku": ["SKU", "Sku"],
-        "permalink": ["Permalink", "Product URL", "URL"],
-        "price": ["Price", "Regular price", "price"],
-        "regular_price": ["Regular price", "Regular Price"],
-        "sale_price": ["Sale price", "Sale Price"],
-        "description": ["Description", "Short description", "Short Description"],
-        "image_url": ["Images", "Image", "Image URL", "Images (URL)"],
-        "category_names": ["Categories", "Category"],
-        "stock_status": ["Stock status", "Stock Status"],
-        "status": ["Published", "Status"],
-        "attributes": ["Attribute 1 name", "Attributes"],  # very variable
-    }
-
-    def pick(colnames):
-        for c in colnames:
-            if c in df.columns:
-                return c
-        return None
-
-    out = pd.DataFrame()
-    out["name"] = df[pick(colmap_candidates["name"])].map(safe_text) if pick(colmap_candidates["name"]) else ""
-    out["sku"] = df[pick(colmap_candidates["sku"])].map(safe_text) if pick(colmap_candidates["sku"]) else ""
-    out["permalink"] = df[pick(colmap_candidates["permalink"])].map(safe_text) if pick(colmap_candidates["permalink"]) else ""
-    out["price"] = df[pick(colmap_candidates["price"])].map(safe_text) if pick(colmap_candidates["price"]) else ""
-    out["regular_price"] = df[pick(colmap_candidates["regular_price"])].map(safe_text) if pick(colmap_candidates["regular_price"]) else out["price"]
-    out["sale_price"] = df[pick(colmap_candidates["sale_price"])].map(safe_text) if pick(colmap_candidates["sale_price"]) else ""
-    out["description"] = df[pick(colmap_candidates["description"])].map(safe_text) if pick(colmap_candidates["description"]) else ""
-    imgcol = pick(colmap_candidates["image_url"])
-    if imgcol:
-        # Woo export sometimes has multiple separated by commas
-        out["image_url"] = df[imgcol].map(lambda x: safe_text(str(x).split(",")[0]) if safe_text(x) else "")
-    else:
-        out["image_url"] = ""
-    catcol = pick(colmap_candidates["category_names"])
-    out["category_names"] = df[catcol].map(lambda x: [safe_text(i) for i in str(x).split(",") if safe_text(i)]) if catcol else [[]] * len(df)
-    out["category_ids"] = [[]] * len(df)
-    out["stock_status"] = df[pick(colmap_candidates["stock_status"])].map(safe_text) if pick(colmap_candidates["stock_status"]) else ""
-    out["status"] = df[pick(colmap_candidates["status"])].map(safe_text) if pick(colmap_candidates["status"]) else "publish"
-    out["on_sale"] = out.apply(is_on_sale, axis=1)
-    out["attributes"] = ""
-    out["short_description"] = ""
-
-    return out
-
-
-# =========================
-# Category tree utilities
-# =========================
-def build_category_tree(categories: List[Dict[str, Any]]):
-    by_id = {c["id"]: c for c in categories if isinstance(c, dict) and "id" in c}
-    children = {}
-    for c in categories:
-        pid = c.get("parent", 0)
-        children.setdefault(pid, []).append(c["id"])
-
-    def descendants(cat_id: int) -> List[int]:
-        res = []
-        stack = [cat_id]
-        seen = set()
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            res.append(x)
-            for ch in children.get(x, []):
-                stack.append(ch)
-        return res
-
-    def path_name(cat_id: int) -> str:
-        parts = []
-        cur = cat_id
-        guard = 0
-        while cur and cur in by_id and guard < 50:
-            parts.append(safe_text(by_id[cur].get("name", "")))
-            cur = by_id[cur].get("parent", 0)
-            guard += 1
-        parts.reverse()
-        return " > ".join([p for p in parts if p])
-
-    all_paths = []
-    for cid in by_id.keys():
-        all_paths.append((path_name(cid), cid))
-
-    all_paths.sort(key=lambda t: t[0].lower())
-    return by_id, children, descendants, all_paths, path_name
-
-
-def category_display_for_product(row: pd.Series, path_name_fn) -> str:
-    # choose the shortest top-level category path (best looking)
-    ids = row.get("category_ids", []) or []
-    if not isinstance(ids, list):
-        ids = []
-    paths = [path_name_fn(i) for i in ids if isinstance(i, int)]
-    paths = [p for p in paths if p]
-    if not paths:
-        # fallback to names
-        names = row.get("category_names", []) or []
-        if isinstance(names, list) and names:
-            return safe_text(names[0])
-        return "Uncategorized"
-    # Prefer the deepest path (more specific)
-    paths.sort(key=lambda p: (p.count(">"), len(p)))
-    return paths[-1]
-
-
-# =========================
-# Image downloading (reliable)
-# =========================
-def download_with_retries(url: str, timeout: int, retries: int, backoff: float, log_fn) -> Optional[bytes]:
-    if not url:
-        return None
-    headers = {"User-Agent": "BkosherCatalogBot/1.0"}
-    for attempt in range(1, retries + 1):
-        try:
-            r = requests.get(url, timeout=timeout, headers=headers)
-            if r.status_code == 200 and r.content:
-                return r.content
-            log_fn(f"IMG: {r.status_code} on attempt {attempt} for image.")
-        except Exception as e:
-            log_fn(f"IMG: error attempt {attempt}: {type(e).__name__}")
-        time.sleep(backoff * attempt)
+def read_logo_bytes() -> Optional[bytes]:
+    for fn in LOGO_FILENAME_CANDIDATES:
+        if os.path.exists(fn):
+            with open(fn, "rb") as f:
+                return f.read()
     return None
 
 
-def preprocess_image_bytes(img_bytes: bytes, max_px: int = 900) -> Optional[bytes]:
-    if not img_bytes:
+def logo_as_data_uri() -> Optional[str]:
+    b = read_logo_bytes()
+    if not b:
         return None
-    if Image is None:
-        return img_bytes  # fpdf2 can often handle it directly
-    try:
-        im = Image.open(io.BytesIO(img_bytes))
-        im = im.convert("RGB")
-        w, h = im.size
-        scale = min(1.0, max_px / max(w, h))
-        if scale < 1.0:
-            im = im.resize((int(w * scale), int(h * scale)))
-        out = io.BytesIO()
-        im.save(out, format="JPEG", quality=85, optimize=True)
-        return out.getvalue()
-    except Exception:
-        return img_bytes
+    # assume png/jpg
+    mime = "image/png" if b[:8].startswith(b"\x89PNG") else "image/jpeg"
+    return f"data:{mime};base64,{base64.b64encode(b).decode('ascii')}"
 
 
-# =========================
-# PDF
-# =========================
-class CatalogPDF(FPDF):
-    def __init__(self, title: str, logo_bytes: Optional[bytes], orientation: str, currency_symbol: str):
-        super().__init__(orientation=orientation, unit="mm", format="A4")
-        self.title_txt = pdf_safe_latin1(title)
-        self.logo_bytes = logo_bytes
-        self.currency = currency_symbol
+# ----------------------------
+# Streamlit UI theme CSS (branding + mobile-friendly)
+# ----------------------------
+def inject_css() -> None:
+    logo_uri = logo_as_data_uri()
+    brand_blue = f"rgb({BRAND_BLUE[0]},{BRAND_BLUE[1]},{BRAND_BLUE[2]})"
+    brand_red = f"rgb({BRAND_RED[0]},{BRAND_RED[1]},{BRAND_RED[2]})"
+    header_logo_html = ""
+    if logo_uri:
+        header_logo_html = f"""
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+          <img src="{logo_uri}" style="height:46px;object-fit:contain;" />
+          <div>
+            <div style="font-weight:800;font-size:22px;color:{brand_blue};line-height:1.1;">
+              B-Kosher Catalog Builder
+            </div>
+            <div style="font-size:12px;color:#6b7280;">Customer-facing PDF catalog generator</div>
+          </div>
+        </div>
+        """
 
-        self.set_auto_page_break(auto=True, margin=12)
-
-        # Use core fonts (latin-1 safe); avoid unicode crashes by sanitizing text
-        self.set_font("Helvetica", size=10)
-
-    def header(self):
-        margin = 10
-        self.set_fill_color(255, 255, 255)
-        self.set_draw_color(*BRAND_BLUE)
-        self.set_line_width(0.3)
-
-        # Logo
-        if self.logo_bytes:
-            try:
-                # write bytes to temp stream for fpdf2
-                # fpdf2 accepts file-like via name? safest: temp file
-                tmp_name = f"/tmp/bk_logo_{os.getpid()}.png"
-                if not os.path.exists(tmp_name):
-                    with open(tmp_name, "wb") as f:
-                        f.write(self.logo_bytes)
-                self.image(tmp_name, x=margin, y=6, w=24)
-            except Exception:
-                pass
-
-        # Title
-        self.set_text_color(*BRAND_BLUE)
-        self.set_xy(margin + 28, 9)
-        self.set_font("Helvetica", "B", 14)
-        self.cell(0, 8, self.title_txt)
-
-        # Page number
-        self.set_font("Helvetica", size=10)
-        self.set_text_color(0, 0, 0)
-        self.set_xy(-30, 9)
-        self.cell(20, 8, f"Page {self.page_no()}", align="R")
-
-        # Underline
-        self.set_draw_color(*BRAND_BLUE)
-        self.line(margin, 18, self.w - margin, 18)
-        self.ln(14)
-
-    def footer(self):
-        margin = 10
-        self.set_y(-12)
-        self.set_draw_color(*BRAND_RED)
-        self.line(margin, self.get_y(), self.w - margin, self.get_y())
-        self.ln(1.5)
-        self.set_font("Helvetica", size=8)
-        self.set_text_color(60, 60, 60)
-        text = f"{BRAND_SITE} | Prices correct as of {now_date_str()}"
-        self.cell(0, 6, pdf_safe_latin1(text))
-
-    def draw_category_bar(self, label: str):
-        margin = 10
-        bar_h = 10
-        y = self.get_y() + 1
-        self.set_fill_color(*BRAND_BLUE)
-        self.set_text_color(255, 255, 255)
-        self.set_font("Helvetica", "B", 11)
-        self.rounded_rect(margin, y, self.w - 2 * margin, bar_h, 2.5, style="F")
-        self.set_xy(margin + 3, y + 2.5)
-        self.cell(0, 5, pdf_safe_latin1(label))
-        self.ln(bar_h + 4)
-        self.set_text_color(0, 0, 0)
-        self.set_font("Helvetica", size=10)
-
-    def rounded_rect(self, x, y, w, h, r, style=""):
-        # fpdf2 supports rounded_rect in newer versions, but keep compatibility
-        try:
-            super().rounded_rect(x, y, w, h, r, style=style)
-        except Exception:
-            # fallback: normal rect
-            if style:
-                self.rect(x, y, w, h, style=style)
-            else:
-                self.rect(x, y, w, h)
-
-    def wrap_text_lines(self, text: str, max_width: float, max_lines: int) -> List[str]:
-        text = pdf_safe_latin1(text)
-        if not text:
-            return []
-        words = text.split(" ")
-        lines = []
-        cur = ""
-        for w in words:
-            candidate = (cur + " " + w).strip()
-            if self.get_string_width(candidate) <= max_width:
-                cur = candidate
-            else:
-                if cur:
-                    lines.append(cur)
-                cur = w
-                if len(lines) >= max_lines:
-                    break
-        if len(lines) < max_lines and cur:
-            lines.append(cur)
-        # If overflow, ellipsize last line
-        if len(lines) == max_lines and len(words) > 0:
-            # ensure last line ends with …
-            last = lines[-1]
-            if self.get_string_width(last) > max_width:
-                # trim
-                while last and self.get_string_width(last + "...") > max_width:
-                    last = last[:-1]
-                lines[-1] = last + "..."
-            else:
-                # check if more words remain (approx)
-                pass
-        return lines[:max_lines]
-
-
-def make_catalog_pdf_bytes(
-    df: pd.DataFrame,
-    title: str,
-    orientation: str,
-    currency_symbol: str,
-    grid: Tuple[int, int],
-    show_price: bool,
-    show_sku: bool,
-    show_description: bool,
-    show_attributes: bool,
-    include_brand: bool,
-    include_kashrut: bool,
-    category_mode: str,
-    category_path_fn,
-    progress_cb=None,
-    log_fn=None,
-) -> bytes:
-    if progress_cb is None:
-        progress_cb = lambda x: None
-    if log_fn is None:
-        log_fn = lambda s: None
-
-    logo_bytes = pick_logo_bytes()
-
-    cols, rows = grid
-    pdf = CatalogPDF(title=title, logo_bytes=logo_bytes, orientation=orientation, currency_symbol=currency_symbol)
-    pdf.add_page()
-
-    margin = 10
-    gutter = 4
-    header_space = 6
-
-    usable_w = pdf.w - 2 * margin
-    usable_h = pdf.h - 26 - 14  # header+footer safety
-
-    card_w = (usable_w - gutter * (cols - 1)) / cols
-    card_h = (usable_h - header_space - gutter * (rows - 1)) / rows
-
-    # Layout areas within card (tuned to prevent overlap)
-    pad = 2.0
-    img_h = card_h * 0.55
-    text_area_h = card_h - img_h - 2 * pad
-
-    # Font sizes adapt
-    name_font = 7.5 if cols >= 6 else 9
-    small_font = 6.5 if cols >= 6 else 8
-
-    # Grouping
-    if category_mode == "path":
-        df = df.copy()
-        df["_cat"] = df.apply(lambda r: category_display_for_product(r, category_path_fn), axis=1)
-    else:
-        df = df.copy()
-        df["_cat"] = df.get("category_names", "").apply(lambda x: safe_text(x[0]) if isinstance(x, list) and x else "Uncategorized")
-
-    df["_cat"] = df["_cat"].fillna("Uncategorized")
-    cats = sorted(df["_cat"].unique(), key=lambda x: str(x).lower())
-
-    total = len(df)
-    done = 0
-
-    for ci, cat in enumerate(cats):
-        subset = df[df["_cat"] == cat].copy()
-        subset = subset.sort_values(by=["name"], key=lambda s: s.str.lower())
-
-        # New page per category if not enough room for bar + at least one row
-        pdf.draw_category_bar(cat)
-
-        x0 = margin
-        y0 = pdf.get_y()
-
-        col_i = 0
-        row_i = 0
-
-        for _, r in subset.iterrows():
-            if row_i >= rows:
-                pdf.add_page()
-                pdf.draw_category_bar(cat)
-                x0 = margin
-                y0 = pdf.get_y()
-                col_i = 0
-                row_i = 0
-
-            xx = x0 + col_i * (card_w + gutter)
-            yy = y0 + row_i * (card_h + gutter)
-
-            # Card border
-            pdf.set_draw_color(*BRAND_BLUE)
-            pdf.set_line_width(0.4)
-            pdf.rect(xx, yy, card_w, card_h)
-
-            # Clickable link for whole card
-            link = safe_text(r.get("permalink", ""))
-            if link:
-                try:
-                    pdf.link(xx, yy, card_w, card_h, link)
-                except Exception:
-                    pass
-
-            # Sale badge
-            if bool(is_on_sale(r)):
-                pdf.set_fill_color(*BRAND_RED)
-                pdf.set_text_color(255, 255, 255)
-                pdf.set_font("Helvetica", "B", 7)
-                badge_w = 12
-                badge_h = 6
-                pdf.rect(xx + card_w - badge_w - 1.2, yy + 1.2, badge_w, badge_h, style="F")
-                pdf.set_xy(xx + card_w - badge_w - 1.2, yy + 1.8)
-                pdf.cell(badge_w, badge_h - 1, "SALE", align="C")
-                pdf.set_text_color(0, 0, 0)
-
-            # Image
-            img_x = xx + pad
-            img_y = yy + pad
-            img_w = card_w - 2 * pad
-
-            img_bytes = r.get("_img_bytes", None)
-            if img_bytes:
-                try:
-                    tmp_name = f"/tmp/bk_img_{sha1(str(r.get('id', '')) + str(r.get('image_url', '')))}.jpg"
-                    if not os.path.exists(tmp_name):
-                        with open(tmp_name, "wb") as f:
-                            f.write(img_bytes)
-                    pdf.image(tmp_name, x=img_x, y=img_y, w=img_w, h=img_h)
-                except Exception:
-                    # draw "No image"
-                    pdf.set_font("Helvetica", "I", 7)
-                    pdf.set_text_color(120, 120, 120)
-                    pdf.set_xy(img_x, img_y + img_h / 2 - 2)
-                    pdf.cell(img_w, 4, "No image", align="C")
-                    pdf.set_text_color(0, 0, 0)
-            else:
-                pdf.set_font("Helvetica", "I", 7)
-                pdf.set_text_color(120, 120, 120)
-                pdf.set_xy(img_x, img_y + img_h / 2 - 2)
-                pdf.cell(img_w, 4, "No image", align="C")
-                pdf.set_text_color(0, 0, 0)
-
-            # Text area
-            text_x = xx + pad
-            text_y = yy + pad + img_h + 1.0
-            text_w = card_w - 2 * pad
-
-            # Product name (max 2 lines)
-            pdf.set_font("Helvetica", "B", name_font)
-            pdf.set_xy(text_x, text_y)
-            name_lines = pdf.wrap_text_lines(safe_text(r.get("name", "")), text_w, max_lines=2)
-            for ln in name_lines:
-                pdf.cell(text_w, 3.5, ln, ln=1)
-                pdf.set_x(text_x)
-
-            # Price
-            pdf.set_font("Helvetica", "B", small_font)
-            if show_price:
-                price = fmt_price(r.get("price", ""), currency_symbol)
-                sale = fmt_price(r.get("sale_price", ""), currency_symbol)
-                reg = fmt_price(r.get("regular_price", ""), currency_symbol)
-
-                # If sale: show sale + struck reg (simple)
-                pdf.set_text_color(*BRAND_RED)
-                if is_on_sale(r) and sale:
-                    pdf.cell(text_w, 3.2, sale, ln=1)
-                    if reg:
-                        pdf.set_text_color(120, 120, 120)
-                        pdf.set_font("Helvetica", "", small_font)
-                        pdf.cell(text_w, 3.0, reg, ln=1)
-                        pdf.set_font("Helvetica", "B", small_font)
-                else:
-                    pdf.cell(text_w, 3.2, price, ln=1)
-                pdf.set_text_color(0, 0, 0)
-
-            # SKU
-            if show_sku:
-                sku = safe_text(r.get("sku", ""))
-                if sku:
-                    pdf.set_font("Helvetica", "", small_font)
-                    pdf.cell(text_w, 3.0, pdf_safe_latin1(f"SKU: {sku}"), ln=1)
-
-            # Brand & Kashrut — (requested: B. Brand and kashrut)
-            # We try to derive:
-            # - brand from "brand" column if present
-            # - kashrut from attributes text if it contains "Kashrus" or "Kashrut" etc.
-            brand = safe_text(r.get("brand", ""))
-            attrs = safe_text(r.get("attributes", ""))
-
-            kashrut_val = ""
-            # naive extraction
-            m = re.search(r"(Kashrut|Kashrus)\s*:\s*([^|]+)", attrs, flags=re.IGNORECASE)
-            if m:
-                kashrut_val = safe_text(m.group(2))
-
-            pdf.set_font("Helvetica", "", small_font)
-            if include_brand and brand:
-                pdf.cell(text_w, 3.0, pdf_safe_latin1(f"Brand: {brand}"), ln=1)
-            if include_kashrut and kashrut_val:
-                pdf.cell(text_w, 3.0, pdf_safe_latin1(f"Kashrus: {kashrut_val}"), ln=1)
-
-            # Description (max 2 lines)
-            if show_description:
-                desc = safe_text(r.get("short_description", "")) or safe_text(r.get("description", ""))
-                if desc:
-                    pdf.set_font("Helvetica", "", small_font)
-                    dlines = pdf.wrap_text_lines(desc, text_w, max_lines=2)
-                    for ln in dlines:
-                        pdf.cell(text_w, 3.0, ln, ln=1)
-                        pdf.set_x(text_x)
-
-            # Attributes (max 2 lines)
-            if show_attributes:
-                at = safe_text(r.get("attributes", ""))
-                if at:
-                    pdf.set_font("Helvetica", "", small_font)
-                    alines = pdf.wrap_text_lines(at, text_w, max_lines=2)
-                    for ln in alines:
-                        pdf.cell(text_w, 3.0, ln, ln=1)
-                        pdf.set_x(text_x)
-
-            # advance grid
-            col_i += 1
-            if col_i >= cols:
-                col_i = 0
-                row_i += 1
-
-            done += 1
-            if done % 25 == 0:
-                progress_cb(min(0.99, done / max(1, total)))
-                log_fn(f"PDF: placed {done}/{total}")
-
-        # after category, move to new page if space too tight for next bar
-        pdf.ln(2)
-        if pdf.get_y() > pdf.h - 60:
-            pdf.add_page()
-
-    # Important: ensure Streamlit receives bytes (not bytearray)
-    out = pdf.output(dest="S")
-    if isinstance(out, (bytearray,)):
-        out = bytes(out)
-    elif isinstance(out, str):
-        out = out.encode("latin-1", "ignore")
-    elif not isinstance(out, (bytes,)):
-        out = bytes(out)
-
-    return out
-
-
-# =========================
-# UI + Flow
-# =========================
-def inject_brand_css():
-    blue = rgb_to_hex(BRAND_BLUE)
-    red = rgb_to_hex(BRAND_RED)
     st.markdown(
         f"""
-        <style>
-            .bk-title {{
-                font-size: 1.4rem;
-                font-weight: 800;
-                color: {blue};
-                margin-bottom: 0.25rem;
-            }}
-            .bk-sub {{
-                color: #666;
-                margin-top: 0;
-            }}
-            div.stButton > button {{
-                background-color: {red} !important;
-                color: white !important;
-                border-radius: 10px !important;
-                border: 0px !important;
-                padding: 0.6rem 1rem !important;
-                font-weight: 700 !important;
-            }}
-            .bk-card {{
-                border: 1px solid #eee;
-                border-radius: 14px;
-                padding: 14px;
-                background: #fff;
-            }}
-        </style>
+<style>
+/* Buttons */
+.stButton > button {{
+  background: {brand_red};
+  color: white;
+  border: 0;
+  border-radius: 10px;
+  padding: 0.55rem 1rem;
+  font-weight: 700;
+}}
+.stButton > button:hover {{ filter: brightness(0.95); }}
+
+/* Section headers */
+h2, h3 {{ color: {brand_blue}; }}
+
+/* Cards */
+.bk-card {{
+  border: 1px solid rgba(0,0,0,0.08);
+  border-radius: 14px;
+  padding: 14px;
+  background: white;
+}}
+.bk-muted {{ color:#6b7280; font-size: 0.9rem; }}
+
+/* Log box */
+.bk-log {{
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  background: #0b1220;
+  color: #d1d5db;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255,255,255,0.08);
+  max-height: 260px;
+  overflow: auto;
+}}
+</style>
+{header_logo_html}
         """,
         unsafe_allow_html=True,
     )
 
 
-def require_login():
-    # Local: allow env var fallback
-    pw = None
-    try:
-        pw = st.secrets.get("APP_PASSWORD", None)
-    except Exception:
-        pw = None
-    if not pw:
-        pw = os.environ.get("APP_PASSWORD", "")
+# ----------------------------
+# Login gate
+# ----------------------------
+def require_login() -> None:
+    st.session_state.setdefault("logged_in", False)
 
-    if not pw:
-        st.warning("APP_PASSWORD is not set (Streamlit secrets or environment). Login is disabled.")
-        return True
+    def get_secret(name: str) -> Optional[str]:
+        try:
+            v = st.secrets.get(name)
+            return str(v) if v is not None else None
+        except Exception:
+            return None
 
-    if st.session_state.get("logged_in"):
-        return True
+    if st.session_state["logged_in"]:
+        return
 
-    st.markdown('<div class="bk-title">B-Kosher Catalog Login</div>', unsafe_allow_html=True)
-    p = st.text_input("Password", type="password")
+    st.markdown("## Login")
+    st.markdown('<div class="bk-card">', unsafe_allow_html=True)
+    st.markdown(
+        "Enter the password to access the catalog builder. "
+        "The password is stored in Streamlit **secrets** (not visible in code)."
+    )
+    pw = st.text_input("Password", type="password")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    expected = get_secret("APP_PASSWORD")
+    if not expected:
+        st.error(
+            "APP_PASSWORD is not set in Streamlit secrets.\n\n"
+            "On Streamlit Cloud: App → Settings → Secrets\n"
+            "Locally: create `.streamlit/secrets.toml` with:\n"
+            'APP_PASSWORD="your_password"'
+        )
+        st.stop()
+
     if st.button("Login"):
-        if p == pw:
+        if pw == expected:
             st.session_state["logged_in"] = True
             st.success("Logged in.")
             st.rerun()
         else:
-            st.error("Wrong password.")
-    st.stop()
+            st.error("Incorrect password.")
+            st.stop()
 
 
-def load_api_creds_from_secrets() -> Optional[WooCreds]:
+# ----------------------------
+# WooCommerce API
+# ----------------------------
+@dataclass
+class WCConfig:
+    store_url: str
+    ck: str
+    cs: str
+    timeout: int = 30
+
+    @property
+    def api_base(self) -> str:
+        return self.store_url.rstrip("/") + "/wp-json/wc/v3"
+
+
+def get_wc_config_from_secrets(timeout: int) -> Optional[WCConfig]:
     try:
-        store_url = st.secrets.get("WC_STORE_URL", "")
-        ck = st.secrets.get("WC_CONSUMER_KEY", "")
-        cs = st.secrets.get("WC_CONSUMER_SECRET", "")
+        store = st.secrets.get("WC_STORE_URL")
+        ck = st.secrets.get("WC_CONSUMER_KEY")
+        cs = st.secrets.get("WC_CONSUMER_SECRET")
+        if not store or not ck or not cs:
+            return None
+        return WCConfig(str(store), str(ck), str(cs), timeout=timeout)
     except Exception:
-        store_url = ck = cs = ""
-    store_url = safe_text(store_url)
-    ck = safe_text(ck)
-    cs = safe_text(cs)
-    if store_url and ck and cs:
-        return WooCreds(store_url=store_url, consumer_key=ck, consumer_secret=cs, timeout=30)
+        return None
+
+
+def wc_get_json(cfg: WCConfig, endpoint: str, params: Dict[str, Any], log_fn) -> Tuple[int, Any, Dict[str, str]]:
+    """GET JSON with safe retries and WITHOUT putting keys in URL."""
+    url = cfg.api_base + endpoint
+    auth = HTTPBasicAuth(cfg.ck, cfg.cs)
+
+    last_exc = None
+    for attempt in range(1, 6):
+        try:
+            r = requests.get(url, params=params, auth=auth, timeout=cfg.timeout)
+            headers = dict(r.headers)
+            if r.status_code >= 400:
+                return r.status_code, None, headers
+            return r.status_code, r.json(), headers
+        except Exception as e:
+            last_exc = e
+            log_fn(f"API network error (attempt {attempt}/5): {type(e).__name__}")
+            time.sleep(min(2 ** attempt, 12))
+    raise last_exc  # bubble up after retries
+
+
+def checkpoint_path(key: str) -> str:
+    return os.path.join(CHKPT_DIR, f"{key}.json")
+
+
+def load_checkpoint(key: str) -> Dict[str, Any]:
+    p = checkpoint_path(key)
+    if os.path.exists(p):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_checkpoint(key: str, data: Dict[str, Any]) -> None:
+    p = checkpoint_path(key)
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, p)
+
+
+def fetch_categories(cfg: WCConfig, log_fn) -> List[Dict[str, Any]]:
+    cats: List[Dict[str, Any]] = []
+    page = 1
+    per_page = 100
+
+    while True:
+        log_fn(f"API: fetching categories page {page}…")
+        status, data, headers = wc_get_json(cfg, "/products/categories", {"per_page": per_page, "page": page}, log_fn)
+        if status >= 400 or not isinstance(data, list):
+            log_fn(f"API categories failed ({status}) at {redact_url(cfg.api_base + '/products/categories')}")
+            break
+        if not data:
+            break
+        cats.extend(data)
+        if len(data) < per_page:
+            break
+        page += 1
+    return cats
+
+
+def build_category_maps(categories: List[Dict[str, Any]]) -> Tuple[Dict[int, Dict[str, Any]], Dict[int, List[int]]]:
+    by_id: Dict[int, Dict[str, Any]] = {}
+    children: Dict[int, List[int]] = {}
+    for c in categories:
+        cid = int(c.get("id"))
+        by_id[cid] = c
+        parent = int(c.get("parent") or 0)
+        children.setdefault(parent, []).append(cid)
+    return by_id, children
+
+
+def category_full_path(cat_id: int, by_id: Dict[int, Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    cur = cat_id
+    guard = 0
+    while cur and cur in by_id and guard < 50:
+        parts.append(safe_unescape(by_id[cur].get("name", "")))
+        cur = int(by_id[cur].get("parent") or 0)
+        guard += 1
+    return " > ".join(reversed([p for p in parts if p]))
+
+
+def descendants(root_id: int, children: Dict[int, List[int]]) -> List[int]:
+    out: List[int] = []
+    stack = [root_id]
+    seen = set()
+    while stack:
+        cid = stack.pop()
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(cid)
+        for ch in children.get(cid, []):
+            stack.append(ch)
+    return out
+
+
+def normalize_wc_product(p: Dict[str, Any], store_url: str) -> Dict[str, Any]:
+    name = safe_unescape(p.get("name", ""))
+    sku = safe_unescape(p.get("sku", ""))
+    status = safe_unescape(p.get("status", ""))
+    stock_status = safe_unescape(p.get("stock_status", ""))
+    permalink = p.get("permalink") or ""
+    if not permalink:
+        pid = p.get("id")
+        if pid:
+            permalink = store_url.rstrip("/") + f"/?p={pid}"
+    price = p.get("price")
+    reg = p.get("regular_price")
+    sale = p.get("sale_price")
+    on_sale = bool(p.get("on_sale"))
+
+    # images
+    img_url = ""
+    images = p.get("images") or []
+    if images and isinstance(images, list):
+        img_url = images[0].get("src") or ""
+
+    # categories list
+    cats = p.get("categories") or []
+    cat_ids: List[int] = []
+    cat_names: List[str] = []
+    if isinstance(cats, list):
+        for c in cats:
+            try:
+                cat_ids.append(int(c.get("id")))
+            except Exception:
+                pass
+            nm = safe_unescape(c.get("name", ""))
+            if nm:
+                cat_names.append(nm)
+
+    # attributes
+    attrs: Dict[str, str] = {}
+    for a in (p.get("attributes") or []):
+        n = safe_unescape(a.get("name", ""))
+        opts = a.get("options") or []
+        if n and isinstance(opts, list) and opts:
+            attrs[n] = ", ".join([safe_unescape(x) for x in opts if safe_unescape(x)])
+
+    # Common “brand/kashrut” keys if present as attributes
+    brand = attrs.get("Brand") or attrs.get("brand") or safe_unescape(p.get("brands", ""))  # some plugins
+    kashrut = attrs.get("Kashrus") or attrs.get("Kashrut") or attrs.get("kashrut") or ""
+
+    short_desc = safe_unescape(p.get("short_description", ""))
+    # strip HTML tags quickly for safety
+    short_desc = re.sub(r"<[^>]+>", "", short_desc).strip()
+
+    return {
+        "id": p.get("id"),
+        "name": name,
+        "sku": sku,
+        "status": status,  # publish/private/draft
+        "stock_status": stock_status,  # instock/outofstock/onbackorder
+        "price": price,
+        "regular_price": reg,
+        "sale_price": sale,
+        "on_sale": on_sale,
+        "image_url": img_url,
+        "permalink": permalink,
+        "category_ids": cat_ids,
+        "category_names": cat_names,
+        "attributes": attrs,
+        "brand": brand,
+        "kashrut": kashrut,
+        "description": short_desc,
+    }
+
+
+def api_fetch_all_products(
+    cfg: WCConfig,
+    include_private_fetch: bool,
+    log_fn,
+    progress_fn,
+    resume_key: str,
+) -> List[Dict[str, Any]]:
+    """
+    Fetch products with disk checkpoint:
+    - saves page number + collected count as it goes
+    - resumes after app restart / iPhone background kill
+    """
+    key = sha1(f"{cfg.store_url}|{cfg.ck[-6:]}|{include_private_fetch}|{resume_key}")
+    chk = load_checkpoint(key)
+
+    # We avoid status=any if the server errors. We'll fallback automatically.
+    wanted_status = "any" if include_private_fetch else "publish"
+    effective_status = chk.get("effective_status") or wanted_status
+    page = int(chk.get("page") or 1)
+
+    all_products: List[Dict[str, Any]] = chk.get("products") or []
+    if not isinstance(all_products, list):
+        all_products = []
+
+    per_page = 25  # smaller pages are more reliable on some hosting
+
+    # Try to detect total pages from headers once
+    total_pages: Optional[int] = chk.get("total_pages")
+
+    log_fn(f"Resume: status={effective_status} page={page} already={len(all_products)}")
+
+    while True:
+        progress_fn(0.0, f"API: fetching products page {page} (status={effective_status})…")
+        params = {"per_page": per_page, "page": page, "status": effective_status}
+
+        status, data, headers = wc_get_json(cfg, "/products", params, log_fn)
+        if status == 500 and effective_status == "any":
+            # fallback: your server (or a plugin) sometimes 500s on status=any
+            log_fn("API returned 500 for status=any. Falling back to status=publish.")
+            effective_status = "publish"
+            page = 1
+            all_products = []
+            save_checkpoint(key, {"effective_status": effective_status, "page": page, "products": all_products})
+            continue
+
+        if status == 401:
+            log_fn("API unauthorized (401). Check the API key permissions.")
+            break
+
+        if status >= 400:
+            log_fn(f"API request failed ({status}) at {redact_url(cfg.api_base + '/products')}")
+            break
+
+        if not isinstance(data, list):
+            log_fn("API returned unexpected response type.")
+            break
+
+        # Total pages
+        try:
+            if total_pages is None and headers.get("X-WP-TotalPages"):
+                total_pages = int(headers["X-WP-TotalPages"])
+        except Exception:
+            total_pages = None
+
+        if not data:
+            break
+
+        for p in data:
+            all_products.append(normalize_wc_product(p, cfg.store_url))
+
+        # Save checkpoint after each page (very important for iPhone/background)
+        save_checkpoint(
+            key,
+            {
+                "effective_status": effective_status,
+                "page": page + 1,
+                "products": all_products,
+                "total_pages": total_pages,
+            },
+        )
+
+        # progress hint
+        if total_pages:
+            frac = min(page / max(total_pages, 1), 1.0)
+            progress_fn(frac, f"Fetched {len(all_products):,} products… ({page}/{total_pages})")
+        else:
+            progress_fn(0.0, f"Fetched {len(all_products):,} products… (page {page})")
+
+        page += 1
+
+        # Streamlit health-check friendliness: yield time
+        time.sleep(0.05)
+
+    # final
+    save_checkpoint(
+        key,
+        {"effective_status": effective_status, "page": page, "products": all_products, "total_pages": total_pages},
+    )
+    return all_products
+
+
+# ----------------------------
+# CSV parsing (Woo export)
+# ----------------------------
+def parse_csv_products(csv_bytes: bytes, store_url: str) -> List[Dict[str, Any]]:
+    df = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, keep_default_na=False)
+    cols = {c.lower(): c for c in df.columns}
+
+    def col(*names: str) -> Optional[str]:
+        for n in names:
+            if n.lower() in cols:
+                return cols[n.lower()]
+        return None
+
+    c_name = col("name")
+    c_sku = col("sku")
+    c_status = col("status")
+    c_stock = col("stock status", "stock_status")
+    c_price = col("price")
+    c_regular = col("regular price", "regular_price")
+    c_sale = col("sale price", "sale_price")
+    c_images = col("images")
+    c_permalink = col("permalink", "product url", "product_url", "url")
+    c_categories = col("categories", "category")
+    c_short = col("short description", "short_description", "description")
+
+    # Attribute columns in Woo export often like: "Attribute 1 name", "Attribute 1 value(s)"
+    attr_name_cols = [c for c in df.columns if re.match(r"attribute\s+\d+\s+name", c, re.I)]
+    attr_val_cols = [c for c in df.columns if re.match(r"attribute\s+\d+\s+value", c, re.I)]
+
+    products: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        name = safe_unescape(row.get(c_name, "")) if c_name else ""
+        sku = safe_unescape(row.get(c_sku, "")) if c_sku else ""
+        status = safe_unescape(row.get(c_status, "publish")) if c_status else "publish"
+        stock = safe_unescape(row.get(c_stock, "")) if c_stock else ""
+        permalink = safe_unescape(row.get(c_permalink, "")) if c_permalink else ""
+        if not permalink:
+            permalink = store_url.rstrip("/")  # fallback
+
+        img_url = ""
+        if c_images:
+            raw = safe_unescape(row.get(c_images, ""))
+            # woo export uses comma-separated
+            if raw:
+                img_url = raw.split(",")[0].strip()
+
+        cat_names: List[str] = []
+        if c_categories:
+            raw = safe_unescape(row.get(c_categories, ""))
+            if raw:
+                cat_names = [x.strip() for x in raw.split(",") if x.strip()]
+
+        attrs: Dict[str, str] = {}
+        for nc, vc in zip(attr_name_cols, attr_val_cols):
+            n = safe_unescape(row.get(nc, "")).strip()
+            v = safe_unescape(row.get(vc, "")).strip()
+            if n and v:
+                attrs[n] = v
+
+        brand = attrs.get("Brand") or attrs.get("brand") or ""
+        kashrut = attrs.get("Kashrus") or attrs.get("Kashrut") or attrs.get("kashrut") or ""
+
+        reg = row.get(c_regular, "") if c_regular else ""
+        sale = row.get(c_sale, "") if c_sale else ""
+        price = row.get(c_price, "") if c_price else (sale or reg)
+        on_sale = bool(str(sale).strip()) and str(sale).strip() != "0"
+
+        desc = safe_unescape(row.get(c_short, "")) if c_short else ""
+
+        products.append(
+            {
+                "id": None,
+                "name": name,
+                "sku": sku,
+                "status": status,
+                "stock_status": stock,
+                "price": price,
+                "regular_price": reg,
+                "sale_price": sale,
+                "on_sale": on_sale,
+                "image_url": img_url,
+                "permalink": permalink,
+                "category_ids": [],
+                "category_names": cat_names,
+                "attributes": attrs,
+                "brand": brand,
+                "kashrut": kashrut,
+                "description": desc,
+            }
+        )
+
+    return products
+
+
+# ----------------------------
+# Image downloading (disk cached)
+# ----------------------------
+def img_cache_path(url: str) -> str:
+    return os.path.join(IMG_CACHE_DIR, sha1(url) + ".jpg")
+
+
+def download_image(url: str, timeout: int, log_fn, retries: int = 6) -> Optional[str]:
+    if not url:
+        return None
+    p = img_cache_path(url)
+    if os.path.exists(p) and os.path.getsize(p) > 2000:
+        return p
+
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, timeout=timeout, stream=True)
+            if r.status_code >= 400:
+                last = f"HTTP {r.status_code}"
+                time.sleep(min(1.5 * attempt, 10))
+                continue
+            b = r.content
+            if not b or len(b) < 2000:
+                last = "Empty"
+                time.sleep(min(1.5 * attempt, 10))
+                continue
+            # normalize to JPEG for PDF
+            im = Image.open(io.BytesIO(b)).convert("RGB")
+            im.thumbnail((900, 900))
+            im.save(p, format="JPEG", quality=85, optimize=True)
+            return p
+        except Exception as e:
+            last = type(e).__name__
+            log_fn(f"Image download retry {attempt}/{retries}: {last}")
+            time.sleep(min(1.5 * attempt, 10))
+    log_fn(f"Image failed: {last}")
     return None
 
 
+# ----------------------------
+# PDF building (FPDF2)
+# ----------------------------
+def wrap_lines(pdf: FPDF, text: str, max_w: float) -> List[str]:
+    """Word-wrap text to fit width using pdf.get_string_width()."""
+    text = safe_unescape(text).strip()
+    if not text:
+        return []
+    words = re.split(r"\s+", text)
+    lines: List[str] = []
+    cur = ""
+    for w in words:
+        test = w if not cur else (cur + " " + w)
+        if pdf.get_string_width(test) <= max_w:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def clip_lines(lines: List[str], max_lines: int) -> List[str]:
+    if len(lines) <= max_lines:
+        return lines
+    out = lines[:max_lines]
+    # add ellipsis to last line
+    out[-1] = (out[-1][: max(0, len(out[-1]) - 1)] + "…") if out[-1] else "…"
+    return out
+
+
+class CatalogPDF(FPDF):
+    def __init__(self, title: str, logo_path: Optional[str], orientation: str, page_size: str):
+        super().__init__(orientation=orientation, unit="mm", format=page_size)
+        self.title_txt = title
+        self.logo_path = logo_path
+        self.set_auto_page_break(auto=False)
+        self.set_margins(10, 10, 10)
+
+    def header(self):
+        # logo
+        y0 = 8
+        if self.logo_path and os.path.exists(self.logo_path):
+            try:
+                self.image(self.logo_path, x=10, y=y0, w=22)
+            except Exception:
+                pass
+
+        # title
+        self.set_text_color(*BRAND_BLUE)
+        self.set_font("Helvetica", "B", 14)
+        self.set_xy(35, y0 + 2)
+        self.cell(0, 6, safe_unescape(self.title_txt), ln=0)
+
+        # page #
+        self.set_text_color(0, 0, 0)
+        self.set_font("Helvetica", "", 9)
+        self.set_xy(-35, y0 + 2)
+        self.cell(25, 6, f"Page {self.page_no()}", align="R")
+
+        # divider line
+        self.set_draw_color(*BRAND_BLUE)
+        self.set_line_width(0.5)
+        self.line(10, 32, self.w - 10, 32)
+
+    def footer(self):
+        self.set_y(-15)
+        # red line
+        self.set_draw_color(*BRAND_RED)
+        self.set_line_width(0.4)
+        self.line(10, self.get_y(), self.w - 10, self.get_y())
+        self.ln(2)
+        self.set_font("Helvetica", "", 8)
+        self.set_text_color(40, 40, 40)
+        self.cell(0, 6, f"{BRAND_SITE} | Prices correct as of {now_str()}", align="L")
+
+
+def build_pdf_bytes(
+    products: List[Dict[str, Any]],
+    title: str,
+    page_orientation: str,
+    grid_cols: int,
+    grid_rows: int,
+    currency_symbol: str,
+    show_price: bool,
+    show_sku: bool,
+    show_description: bool,
+    show_attributes: bool,
+    exclude_oos: bool,
+    only_sale: bool,
+    include_private_in_pdf: bool,
+    category_by_id: Optional[Dict[int, Dict[str, Any]]],
+    category_children: Optional[Dict[int, List[int]]],
+) -> bytes:
+    # filter status
+    filtered: List[Dict[str, Any]] = []
+    for p in products:
+        stt = (p.get("status") or "").lower().strip()
+        if not include_private_in_pdf and stt and stt != "publish":
+            continue
+        if exclude_oos and (p.get("stock_status") or "").lower() == "outofstock":
+            continue
+        if only_sale and not bool(p.get("on_sale")):
+            continue
+        filtered.append(p)
+
+    # sort by category tree path + product name
+    def best_cat_path(p: Dict[str, Any]) -> str:
+        # API provides ids; CSV provides names. We'll prefer ids if present.
+        if category_by_id and p.get("category_ids"):
+            paths = [category_full_path(int(cid), category_by_id) for cid in p["category_ids"] if int(cid) in category_by_id]
+            paths = [x for x in paths if x]
+            if paths:
+                return sorted(paths)[0]
+        # fallback
+        names = p.get("category_names") or []
+        if names:
+            return sorted([safe_unescape(x) for x in names if safe_unescape(x)])[0]
+        return "Uncategorised"
+
+    filtered.sort(key=lambda p: (best_cat_path(p), safe_unescape(p.get("name", "")).lower()))
+
+    # group by best cat path
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for p in filtered:
+        g = best_cat_path(p)
+        groups.setdefault(g, []).append(p)
+
+    # Prepare logo file for PDF
+    logo_path = None
+    b = read_logo_bytes()
+    if b:
+        logo_path = os.path.join(APP_CACHE_DIR, "logo.png")
+        with open(logo_path, "wb") as f:
+            f.write(b)
+
+    orientation = "L" if page_orientation.lower().startswith("land") else "P"
+    pdf = CatalogPDF(title=title, logo_path=logo_path, orientation=orientation, page_size="A4")
+    pdf.set_title(title)
+
+    # layout constants
+    margin = 10
+    header_h = 34
+    footer_h = 18
+    cat_bar_h = 10
+    gap = 4
+
+    # card metrics depend on grid
+    usable_w = pdf.w - 2 * margin
+    usable_h = pdf.h - header_h - footer_h - margin - cat_bar_h
+
+    card_w = (usable_w - gap * (grid_cols - 1)) / grid_cols
+    card_h = (usable_h - gap * (grid_rows - 1)) / grid_rows
+
+    # typography for dense grids
+    if grid_cols >= 6:
+        name_font = 7.2
+        meta_font = 6.2
+        price_font = 7.0
+        max_name_lines = 2
+        max_meta_lines = 1
+        max_attr_lines = 1
+    else:
+        name_font = 8.6
+        meta_font = 7.2
+        price_font = 8.2
+        max_name_lines = 2
+        max_meta_lines = 2
+        max_attr_lines = 2
+
+    def draw_category_bar(cat_name: str):
+        bar_y = header_h + 4
+        pdf.set_xy(margin, bar_y)
+        pdf.set_fill_color(*BRAND_BLUE)
+        pdf.set_draw_color(*BRAND_BLUE)
+        pdf.rect(margin, bar_y, pdf.w - 2 * margin, cat_bar_h, style="F")
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_xy(margin + 4, bar_y + 2.5)
+        # avoid duplicated category text: single bar only
+        pdf.cell(0, 5, safe_unescape(cat_name), ln=0)
+
+    def draw_sale_badge(x: float, y: float):
+        pdf.set_fill_color(*BRAND_RED)
+        pdf.set_draw_color(*BRAND_RED)
+        pdf.rect(x, y, 14, 6, style="F")
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 7)
+        pdf.set_xy(x, y + 1.2)
+        pdf.cell(14, 4, "SALE", align="C")
+
+    def draw_card(p: Dict[str, Any], x: float, y: float):
+        # clickable area
+        link_url = safe_unescape(p.get("permalink", "")).strip()
+
+        # outer box
+        pdf.set_draw_color(*BRAND_BLUE)
+        pdf.set_line_width(0.4)
+        pdf.rect(x, y, card_w, card_h)
+
+        # reserve areas
+        pad = 2.2
+        img_h = card_h * (0.60 if grid_cols >= 6 else 0.62)
+        text_top = y + img_h + pad
+
+        # image box
+        img_x = x + pad
+        img_y = y + pad
+        img_w = card_w - 2 * pad
+        img_h2 = img_h - 2 * pad
+
+        # image (no grey background)
+        img_path = None
+        if p.get("image_url"):
+            img_path = download_image(str(p.get("image_url")), timeout=20, log_fn=lambda *_: None)
+
+        if img_path and os.path.exists(img_path):
+            try:
+                pdf.image(img_path, x=img_x, y=img_y, w=img_w, h=img_h2)
+            except Exception:
+                pass
+        else:
+            pdf.set_text_color(120, 120, 120)
+            pdf.set_font("Helvetica", "I", 7)
+            pdf.set_xy(img_x, img_y + img_h2 / 2 - 2)
+            pdf.cell(img_w, 4, "No image", align="C")
+
+        # sale badge
+        if bool(p.get("on_sale")):
+            draw_sale_badge(x + card_w - 16, y + 2)
+
+        # Name (wrapped, clipped)
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("Helvetica", "B", name_font)
+        name_lines = clip_lines(wrap_lines(pdf, p.get("name", ""), card_w - 2 * pad), max_name_lines)
+        yy = text_top
+        pdf.set_xy(x + pad, yy)
+        pdf.multi_cell(card_w - 2 * pad, 3.2 if grid_cols >= 6 else 3.6, "\n".join(name_lines), align="C")
+        yy = pdf.get_y() + 0.2
+
+        # Price line
+        if show_price:
+            sale = p.get("sale_price")
+            reg = p.get("regular_price")
+            pr = p.get("price")
+            # choose displayed price
+            disp = money_fmt(sale or pr or reg, currency_symbol=currency_symbol)
+            reg_fmt = money_fmt(reg, currency_symbol=currency_symbol) if reg else ""
+            pdf.set_font("Helvetica", "B", price_font)
+            pdf.set_text_color(*BRAND_RED)
+            pdf.set_xy(x + pad, yy)
+            pdf.cell(card_w - 2 * pad, 4, disp, align="C")
+            # strike-through regular if on sale and reg exists
+            if bool(p.get("on_sale")) and reg_fmt:
+                pdf.set_text_color(120, 120, 120)
+                pdf.set_font("Helvetica", "", max(price_font - 1.2, 6))
+                pdf.set_xy(x + pad, yy + 3.4)
+                pdf.cell(card_w - 2 * pad, 3.2, reg_fmt, align="C")
+            yy = yy + (7 if grid_cols >= 6 else 8)
+
+        # SKU
+        if show_sku and p.get("sku"):
+            pdf.set_text_color(60, 60, 60)
+            pdf.set_font("Helvetica", "", meta_font)
+            lines = clip_lines(wrap_lines(pdf, f"SKU: {p.get('sku')}", card_w - 2 * pad), 1)
+            pdf.set_xy(x + pad, yy)
+            pdf.cell(card_w - 2 * pad, 3.2, lines[0], align="C")
+            yy += 3.8
+
+        # Brand / Kashrut
+        brand = safe_unescape(p.get("brand", ""))
+        kash = safe_unescape(p.get("kashrut", ""))
+        meta_parts = []
+        if brand:
+            meta_parts.append(f"Brand: {brand}")
+        if kash:
+            meta_parts.append(f"Kashrus: {kash}")
+        if meta_parts:
+            pdf.set_text_color(60, 60, 60)
+            pdf.set_font("Helvetica", "", meta_font)
+            meta_text = " | ".join(meta_parts)
+            meta_lines = clip_lines(wrap_lines(pdf, meta_text, card_w - 2 * pad), max_meta_lines)
+            pdf.set_xy(x + pad, yy)
+            pdf.multi_cell(card_w - 2 * pad, 3.0, "\n".join(meta_lines), align="C")
+            yy = pdf.get_y() + 0.2
+
+        # Attributes (compact)
+        if show_attributes and isinstance(p.get("attributes"), dict) and p["attributes"]:
+            # show top few attributes, excluding Brand/Kashrus duplicates
+            items = []
+            for k, v in p["attributes"].items():
+                kk = safe_unescape(k)
+                if kk.lower() in ("brand", "kashrus", "kashrut"):
+                    continue
+                vv = safe_unescape(v)
+                if kk and vv:
+                    items.append(f"{kk}: {vv}")
+            if items:
+                pdf.set_text_color(70, 70, 70)
+                pdf.set_font("Helvetica", "", meta_font)
+                txt = "; ".join(items[:2])
+                attr_lines = clip_lines(wrap_lines(pdf, txt, card_w - 2 * pad), max_attr_lines)
+                pdf.set_xy(x + pad, yy)
+                pdf.multi_cell(card_w - 2 * pad, 2.8, "\n".join(attr_lines), align="C")
+                yy = pdf.get_y() + 0.2
+
+        # Description (very short)
+        if show_description and p.get("description"):
+            pdf.set_text_color(70, 70, 70)
+            pdf.set_font("Helvetica", "", meta_font)
+            desc_lines = clip_lines(wrap_lines(pdf, p.get("description", ""), card_w - 2 * pad), 2 if grid_cols < 6 else 1)
+            pdf.set_xy(x + pad, yy)
+            pdf.multi_cell(card_w - 2 * pad, 2.8, "\n".join(desc_lines), align="C")
+
+        # Make the whole card clickable (if link exists)
+        if link_url:
+            try:
+                pdf.link(x, y, card_w, card_h, link_url)
+            except Exception:
+                pass
+
+    # draw
+    for cat_name, plist in groups.items():
+        pdf.add_page()
+        draw_category_bar(cat_name)
+
+        start_x = margin
+        start_y = header_h + 4 + cat_bar_h + 6
+
+        i = 0
+        for p in plist:
+            row = (i // grid_cols) % grid_rows
+            col = i % grid_cols
+            page_slot = i // (grid_cols * grid_rows)
+            if page_slot > 0 and (i % (grid_cols * grid_rows) == 0):
+                pdf.add_page()
+                draw_category_bar(cat_name)
+                start_y = header_h + 4 + cat_bar_h + 6
+
+            xx = start_x + col * (card_w + gap)
+            yy = start_y + row * (card_h + gap)
+            draw_card(p, xx, yy)
+            i += 1
+
+    out = pdf.output()  # bytes in modern fpdf2, sometimes bytearray
+    if isinstance(out, bytearray):
+        out = bytes(out)
+    if isinstance(out, str):
+        out = out.encode("latin-1", "ignore")
+    return out
+
+
+# ----------------------------
+# App
+# ----------------------------
 def main():
-    st.caption("APP VERSION: 2026-02-08-PRIVATE-TOGGLE-V2")
-    st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
-    inject_brand_css()
+    st.set_page_config(page_title="B-Kosher Catalog Builder", page_icon="🧾", layout="wide")
+    inject_css()
     require_login()
 
-    logo_bytes = pick_logo_bytes()
-    col1, col2 = st.columns([1, 8])
-    with col1:
-        if logo_bytes:
-            st.image(logo_bytes, use_column_width=True)
-    with col2:
-        st.markdown(f'<div class="bk-title">{DEFAULT_TITLE}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="bk-sub">Default = WooCommerce API. CSV upload is a backup option121.</div>', unsafe_allow_html=True)
+    # --- Step 1: Source (default API) ---
+    st.markdown("## Step 1 — Choose data source")
+    st.caption("Default = WooCommerce API. CSV upload is a backup option.")
 
-    st.divider()
+    source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
 
-    # -------------------------
-    # Step 1: source (API default)
-    # -------------------------
-    if "source" not in st.session_state:
-        st.session_state["source"] = "api"
+    # State
+    st.session_state.setdefault("products", [])
+    st.session_state.setdefault("categories", [])
+    st.session_state.setdefault("cat_by_id", None)
+    st.session_state.setdefault("cat_children", None)
 
-    st.markdown("### Step 1 — Choose data source")
-    src = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
-    st.session_state["source"] = "api" if src == "WooCommerce API" else "csv"
-
-    # -------------------------
-    # Step 2: Load products
-    # -------------------------
-    st.markdown("### Step 2 — Load products")
-
-    api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
-    include_private_fetch = st.checkbox(
-        "Include private/unpublished products (requires API user permission)",
-        value=False,
-        help="This affects API fetching. If enabled, the app fetches publish + private and merges them.",
-    )
-
-    # live log box
+    # Live log UI
+    st.markdown("### Live log")
     log_box = st.empty()
+    st.session_state.setdefault("log_lines", [])
+
+    def log(msg: str) -> None:
+        st.session_state["log_lines"].append(msg)
+        st.session_state["log_lines"] = st.session_state["log_lines"][-300:]
+        log_box.markdown('<div class="bk-log">' + "\n".join(st.session_state["log_lines"]) + "</div>", unsafe_allow_html=True)
+
+    # Progress UI
     progress = st.progress(0.0)
+    status = st.empty()
 
-    def log(msg: str):
-        msg = safe_text(msg)
-        lines = st.session_state.get("log_lines", [])
-        lines.append(msg)
-        lines = lines[-12:]
-        st.session_state["log_lines"] = lines
-        log_box.code("\n".join(lines))
+    def progress_fn(frac: float, msg: str) -> None:
+        if frac and frac > 0:
+            progress.progress(min(max(frac, 0.0), 1.0))
+        status.info(msg)
 
-    def prog(x: float):
-        progress.progress(max(0.0, min(1.0, float(x))))
+    st.markdown("---")
 
-    # Buttons
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        load_btn = st.button("Load (use cache if available)")
-    with c2:
-        refresh_btn = st.button("Refresh cache (fetch again)")
+    # --- Step 2: Load products ---
+    st.markdown("## Step 2 — Load products")
 
-    # CSV uploader if selected
-    uploaded_csv = None
-    if st.session_state["source"] == "csv":
-        uploaded_csv = st.file_uploader("Upload WooCommerce product export CSV", type=["csv"])
-
-    # Load cache if exists and not refresh
-    if SESSION_CACHE_KEY not in st.session_state:
-        st.session_state[SESSION_CACHE_KEY] = None
-
-    if refresh_btn:
-        st.session_state[SESSION_CACHE_KEY] = None
-        st.session_state["api_resume"] = None
-        st.session_state["log_lines"] = []
-        st.success("Cache cleared. Click Load to fetch again.")
-
-    if load_btn:
-        st.session_state["log_lines"] = []
-        prog(0.02)
-
-        if st.session_state["source"] == "csv":
-            if not uploaded_csv:
-                st.error("Please upload a CSV first.")
-            else:
-                log("CSV: loading…")
-                df = load_products_from_csv(uploaded_csv.getvalue())
-                st.session_state[SESSION_CACHE_KEY] = df
-                prog(1.0)
-                st.success(f"Loaded {len(df):,} products from CSV.")
-        else:
-            creds = load_api_creds_from_secrets()
-            if not creds:
-                st.error("WooCommerce API secrets are missing. Add WC_STORE_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET to Streamlit secrets.")
-            else:
-                creds.timeout = int(api_timeout)
-                log("Loading category hierarchy…")
-                cats = fetch_all_categories(creds, log, prog)
-                st.session_state["api_categories"] = cats
-
-                log("Fetching products from API…")
-                resume_state = st.session_state.get("api_resume", None)
-
-                # Always fetch publish
-                publish_items = fetch_products_by_status(creds, "publish", log, prog, resume_state=None)
-
-                items = publish_items
-
-                # Optional: private
-                if include_private_fetch:
-                    log("Fetching private products…")
-                    private_items = fetch_products_by_status(creds, "private", log, prog, resume_state=None)
-                    # Some sites also store unpublished as draft; do NOT default fetch (often forbidden)
-                    # but we can try softly:
-                    log("Attempting draft products (if permitted)…")
-                    draft_items = fetch_products_by_status(creds, "draft", log, prog, resume_state=None)
-
-                    # Merge unique by id
-                    merged = {}
-                    for p in (publish_items + private_items + draft_items):
-                        pid = p.get("id")
-                        if pid is not None:
-                            merged[pid] = p
-                    items = list(merged.values())
-
-                df = normalize_products_from_api(items)
-                st.session_state[SESSION_CACHE_KEY] = df
-                prog(1.0)
-                st.success(f"Loaded {len(df):,} products from API.")
-
-    df: Optional[pd.DataFrame] = st.session_state.get(SESSION_CACHE_KEY, None)
-    if df is None or len(df) == 0:
-        st.info("Load products to continue.")
-        return
-
-    st.caption(f"Loaded products in memory: **{len(df):,}**")
-
-    # Build category tree if available
-    categories = st.session_state.get("api_categories", []) or []
-    by_id = children = descendants = all_paths = path_name_fn = None
-    if categories:
-        by_id, children, descendants, all_paths, path_name_fn = build_category_tree(categories)
-
-    st.divider()
-
-    # -------------------------
-    # Step 3: Filters + Settings
-    # -------------------------
-    st.markdown("### Step 3 — Filters & PDF settings")
-
-    left, right = st.columns([1.1, 1.2])
-
-    with left:
-        st.markdown("#### Filters")
-
-        # IMPORTANT: This is the checkbox you keep asking for — in FILTERS (affects PDF)
-        include_private_in_pdf = st.checkbox(
-            "Include private/unpublished products in the catalog",
+    if source == "WooCommerce API":
+        api_timeout = st.slider("API timeout (seconds)", 10, 60, 30)
+        include_private_fetch = st.checkbox(
+            "Include private/unpublished products (requires API user permission)",
             value=False,
-            help="If unchecked, private/draft items will be filtered out even if they were fetched.",
+            help="If your API user lacks permission, the app will automatically fall back to published products.",
         )
 
-        exclude_oos = st.checkbox("Exclude out-of-stock", value=False)
-        only_sale = st.checkbox("Only sale items", value=False)
+        cfg = get_wc_config_from_secrets(api_timeout)
+        if not cfg:
+            st.error(
+                "WooCommerce API secrets not set.\n\nSet these in Streamlit secrets:\n"
+                "WC_STORE_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET"
+            )
+            st.stop()
 
-        search = st.text_input("Search (name or SKU)", value="")
+        c1, c2 = st.columns([1, 1])
+        with c1:
+            if st.button("Load (use cache if available)"):
+                # If already checkpointed, it resumes automatically
+                st.session_state["log_lines"] = []
+                log("Loading category hierarchy…")
+                cats = fetch_categories(cfg, log)
+                st.session_state["categories"] = cats
+                by_id, children = build_category_maps(cats)
+                st.session_state["cat_by_id"] = by_id
+                st.session_state["cat_children"] = children
 
-        # Category selection (parent works)
-        selected_cat_ids = []
-        if all_paths and descendants:
-            options = [p for (p, cid) in all_paths]
-            selected_paths = st.multiselect("Categories (tree)", options=options)
-            if selected_paths:
-                # map to ids and include descendants
-                name_to_id = {p: cid for (p, cid) in all_paths}
-                root_ids = [name_to_id[p] for p in selected_paths if p in name_to_id]
-                selected_set = set()
-                for rid in root_ids:
-                    for d in descendants(rid):
-                        selected_set.add(d)
-                selected_cat_ids = sorted(list(selected_set))
-        else:
-            # CSV fallback
-            cat_names = []
-            for v in df.get("category_names", []):
-                if isinstance(v, list):
-                    cat_names.extend(v)
-            cat_names = sorted(set([safe_text(x) for x in cat_names if safe_text(x)]), key=lambda x: x.lower())
-            selected_names = st.multiselect("Categories", options=cat_names)
-            selected_cat_ids = selected_names  # name-based
+                log("Fetching products from API… (resume-safe)")
+                products = api_fetch_all_products(
+                    cfg,
+                    include_private_fetch=include_private_fetch,
+                    log_fn=log,
+                    progress_fn=progress_fn,
+                    resume_key="products",
+                )
+                st.session_state["products"] = products
+                progress.progress(1.0)
+                status.success(f"Loaded {len(products):,} products.")
+        with c2:
+            if st.button("Refresh cache (fetch again)"):
+                # Clear checkpoints for both modes
+                st.session_state["log_lines"] = []
+                for fn in os.listdir(CHKPT_DIR):
+                    if fn.endswith(".json"):
+                        try:
+                            os.remove(os.path.join(CHKPT_DIR, fn))
+                        except Exception:
+                            pass
+                st.success("Cleared checkpoints. Now click Load to fetch again.")
 
-        st.markdown("#### Display options")
+    else:
+        up = st.file_uploader("Upload WooCommerce product export CSV", type=["csv"])
+        if up is not None:
+            st.session_state["log_lines"] = []
+            log("Parsing CSV…")
+            # Use store URL secret if available, else fallback
+            store_url = st.secrets.get("WC_STORE_URL", "https://www.b-kosher.co.uk")
+            products = parse_csv_products(up.getvalue(), str(store_url))
+            st.session_state["products"] = products
+            progress.progress(1.0)
+            status.success(f"Loaded {len(products):,} products from CSV.")
 
+    products: List[Dict[str, Any]] = st.session_state.get("products") or []
+    if not products:
+        st.info("Load products to continue.")
+        st.stop()
+
+    st.markdown("---")
+
+    # --- Step 3: Filters + PDF settings ---
+    st.markdown("## Step 3 — Configure catalog")
+
+    # Grid density presets
+    GRID_PRESETS = {
+        "Standard (3×3)": (3, 3),
+        "Compact (6×5)": (6, 5),   # chosen to prevent text overflow vs 6×6
+        "Medium (4×4)": (4, 4),
+        "Large (2×3)": (2, 3),
+    }
+
+    colA, colB, colC = st.columns([1, 1, 1])
+
+    with colA:
+        page_orientation = st.selectbox("Page orientation", ["Portrait", "Landscape"], index=0)
+        grid_label = st.selectbox("Grid density", list(GRID_PRESETS.keys()), index=0)
+        grid_cols, grid_rows = GRID_PRESETS[grid_label]
         currency_symbol = st.text_input("Currency symbol", value="£")
 
-        # Defaults requested: SKU + Description off
+    with colB:
+        # Defaults requested: SKU + description unticked
         show_price = st.checkbox("Show price", value=True)
         show_sku = st.checkbox("Show SKU", value=False)
         show_description = st.checkbox("Show description", value=False)
         show_attributes = st.checkbox("Show attributes", value=True)
 
-        # Brand + Kashrut option you selected earlier ("B. Brand and kashrut")
-        include_brand = st.checkbox("Show Brand line", value=True)
-        include_kashrut = st.checkbox("Show Kashrut line", value=True)
+    with colC:
+        exclude_oos = st.checkbox("Exclude out-of-stock", value=False)
+        only_sale = st.checkbox("Only sale items", value=False)
 
-        grid_density = st.selectbox("Grid density", ["Standard (3×3)", "Compact (6×5)"], index=0)
+        # ✅ This is the missing toggle you asked for (in the PDF/filter step)
+        include_private_in_pdf = st.checkbox(
+            "Include private/unpublished products in the catalog",
+            value=False,
+            help="Controls what goes into the PDF. (To FETCH private products, tick it in Step 2 as well.)",
+        )
 
-        orientation = st.selectbox("Page orientation", ["Portrait", "Landscape"], index=0)
+    # Category selection (supports parent categories and includes descendants)
+    st.markdown("### Categories (tree)")
+    cat_by_id = st.session_state.get("cat_by_id")
+    cat_children = st.session_state.get("cat_children")
 
-        title = st.text_input("PDF title", value=DEFAULT_TITLE)
+    # Build selectable category options
+    cat_options: List[Tuple[str, Any]] = []
+    if cat_by_id and isinstance(cat_by_id, dict):
+        for cid in sorted(cat_by_id.keys(), key=lambda x: category_full_path(x, cat_by_id)):
+            path = category_full_path(cid, cat_by_id)
+            if path:
+                cat_options.append((path, cid))
+
+        selected_paths = st.multiselect(
+            "Choose categories (select a parent like 'Alcohol' to include its children)",
+            options=[p for p, _ in cat_options],
+            default=[],
+        )
+        selected_ids = [cid for p, cid in cat_options if p in selected_paths]
+        selected_all_ids: List[int] = []
+        if selected_ids and cat_children:
+            for rid in selected_ids:
+                selected_all_ids.extend(descendants(int(rid), cat_children))
+            selected_all_ids = sorted(list(set(selected_all_ids)))
+    else:
+        # CSV fallback: use category names seen in file
+        all_names = sorted(
+            list(
+                {
+                    safe_unescape(n)
+                    for p in products
+                    for n in (p.get("category_names") or [])
+                    if safe_unescape(n)
+                }
+            )
+        )
+        selected_names = st.multiselect("Choose categories", options=all_names, default=[])
+        selected_all_ids = []
+        selected_ids = []
+        selected_paths = selected_names
+
+    search = st.text_input("Search (name or SKU)", value="")
 
     # Apply filters
-    filtered = df.copy()
+    filtered: List[Dict[str, Any]] = []
+    s = search.strip().lower()
 
-    # status filtering for PDF
-if "status" in filtered.columns:
-    if include_private_in_pdf:
-        filtered = filtered[filtered["status"].isin(["publish", "private"])]
-    else:
-        filtered = filtered[filtered["status"].isin(["publish"])]
-    if exclude_oos and "stock_status" in filtered.columns:
-        filtered = filtered[filtered["stock_status"].astype(str).str.lower().isin(["instock", "onbackorder"])]
+    for p in products:
+        # status in PDF filter happens in build_pdf too, but also here for preview count
+        stt = (p.get("status") or "").lower().strip()
+        if not include_private_in_pdf and stt and stt != "publish":
+            continue
 
-    if only_sale:
-        filtered = filtered[filtered.apply(is_on_sale, axis=1)]
+        if exclude_oos and (p.get("stock_status") or "").lower() == "outofstock":
+            continue
+        if only_sale and not bool(p.get("on_sale")):
+            continue
 
-    if search.strip():
-        s = search.strip().lower()
-        filtered = filtered[
-            filtered["name"].astype(str).str.lower().str.contains(s, na=False)
-            | filtered["sku"].astype(str).str.lower().str.contains(s, na=False)
-        ]
+        # category filter
+        if cat_by_id and selected_ids:
+            p_ids = p.get("category_ids") or []
+            if not any(int(cid) in selected_all_ids for cid in p_ids):
+                continue
+        elif (not cat_by_id) and selected_paths:
+            p_names = [safe_unescape(x) for x in (p.get("category_names") or [])]
+            if not any(n in selected_paths for n in p_names):
+                continue
 
-    # category filtering
-    if selected_cat_ids:
-        if categories and isinstance(selected_cat_ids[0], int):
-            filtered = filtered[filtered["category_ids"].apply(lambda ids: any((i in selected_cat_ids) for i in (ids or [])) if isinstance(ids, list) else False)]
-        else:
-            # name based
-            sel_names = set([safe_text(x) for x in selected_cat_ids])
-            filtered = filtered[filtered["category_names"].apply(lambda names: any((safe_text(n) in sel_names) for n in (names or [])) if isinstance(names, list) else False)]
+        # search filter
+        if s:
+            nm = safe_unescape(p.get("name", "")).lower()
+            sku = safe_unescape(p.get("sku", "")).lower()
+            if s not in nm and s not in sku:
+                continue
 
-    # Count summary
-    with right:
-        st.markdown("#### Selection summary")
-        st.markdown(f'<div class="bk-card"><b>Selected products:</b> {len(filtered):,}</div>', unsafe_allow_html=True)
+        filtered.append(p)
 
-        with st.expander("Preview (first 9 products)", expanded=False):
-            prev = filtered.head(9)
-            if len(prev) == 0:
-                st.info("No products match filters.")
-            else:
-                for _, r in prev.iterrows():
-                    st.write(f"• **{safe_text(r.get('name',''))}** ({safe_text(r.get('status',''))}) — {fmt_price(r.get('price',''), currency_symbol)}")
+    st.info(f"Selected products: {len(filtered):,}")
 
-        st.markdown("#### Image download preset")
-        preset = st.selectbox("Image download preset", ["Reliable", "Balanced", "Fast"], index=0)
+    with st.expander("Preview (first 12 products)", expanded=False):
+        cols = st.columns(4)
+        for i, p in enumerate(filtered[:12]):
+            with cols[i % 4]:
+                img_url = p.get("image_url") or ""
+                if img_url:
+                    st.image(img_url, use_column_width=True)
+                st.markdown(f"**{safe_unescape(p.get('name',''))}**")
+                if show_price:
+                    st.markdown(f"<span style='color:rgb({BRAND_RED[0]},{BRAND_RED[1]},{BRAND_RED[2]});font-weight:800;'>{money_fmt(p.get('sale_price') or p.get('price') or p.get('regular_price'), currency_symbol)}</span>", unsafe_allow_html=True)
+                if p.get("permalink"):
+                    st.link_button("Open product", p["permalink"])
 
-        if preset == "Reliable":
-            dl_workers, dl_retries, dl_timeout = 3, 6, 30
-        elif preset == "Balanced":
-            dl_workers, dl_retries, dl_timeout = 6, 4, 20
-        else:
-            dl_workers, dl_retries, dl_timeout = 10, 2, 15
+    st.markdown("---")
 
-        st.caption("Reliable is recommended on mobile / large catalogs.")
+    st.markdown("## Step 4 — Generate PDF")
+    title = st.text_input("Catalog title", value=DEFAULT_TITLE)
 
-    st.divider()
+    if st.button("Generate PDF"):
+        st.session_state["log_lines"] = []
+        log("Preparing PDF…")
+        progress.progress(0.05)
+        status.info("Building PDF…")
 
-    # -------------------------
-    # Step 4: Generate PDF
-    # -------------------------
-    st.markdown("### Step 4 — Generate PDF")
-
-    generate = st.button("Generate PDF")
-
-    if generate:
-        if len(filtered) == 0:
-            st.error("No products selected.")
-            return
-
-        status = st.empty()
-        progress2 = st.progress(0.0)
-        log_box2 = st.empty()
-        st.session_state["log_lines_pdf"] = []
-
-        def log2(m):
-            m = safe_text(m)
-            lines = st.session_state.get("log_lines_pdf", [])
-            lines.append(m)
-            lines = lines[-14:]
-            st.session_state["log_lines_pdf"] = lines
-            log_box2.code("\n".join(lines))
-
-        def prog2(x):
-            progress2.progress(max(0.0, min(1.0, float(x))))
-
-        # Download images (reliable)
-        status.info("Stage 1/2 — Downloading images…")
-        log2(f"Workers={dl_workers} retries={dl_retries} timeout={dl_timeout}")
-
-        work_df = filtered.copy()
-
-        # Cache images by url in session to avoid re-downloading on rerun
-        if "img_cache" not in st.session_state:
-            st.session_state["img_cache"] = {}
-        img_cache: Dict[str, bytes] = st.session_state["img_cache"]
-
-        urls = work_df["image_url"].fillna("").astype(str).tolist()
-        unique_urls = [u for u in sorted(set(urls)) if u]
-
-        total_u = len(unique_urls)
-        done_u = 0
-
-        def dl_one(url):
-            if url in img_cache:
-                return url, img_cache[url]
-            b = download_with_retries(url, timeout=dl_timeout, retries=dl_retries, backoff=0.6, log_fn=log2)
-            if b:
-                b = preprocess_image_bytes(b)
-                img_cache[url] = b
-            return url, b
-
-        with futures.ThreadPoolExecutor(max_workers=dl_workers) as ex:
-            futs = [ex.submit(dl_one, u) for u in unique_urls]
-            for f in futures.as_completed(futs):
-                url, b = f.result()
-                done_u += 1
-                if done_u % 10 == 0 or done_u == total_u:
-                    prog2(min(0.75, done_u / max(1, total_u) * 0.75))
-                    log2(f"Images: {done_u}/{total_u}")
-
-        # Map bytes onto rows
-        work_df["_img_bytes"] = work_df["image_url"].map(lambda u: img_cache.get(u, None) if safe_text(u) else None)
-
-        # PDF grid
-        if grid_density.startswith("Standard"):
-            grid = (3, 3) if orientation == "Portrait" else (4, 3)
-        else:
-            # Compact = 6×5 (not 6×6) to prevent text loss
-            grid = (6, 5) if orientation == "Portrait" else (6, 5)
-
-        status.info("Stage 2/2 — Building PDF…")
-
-        pdf_bytes = make_catalog_pdf_bytes(
-            work_df,
+        pdf_bytes = build_pdf_bytes(
+            products=filtered,
             title=title,
-            orientation="P" if orientation == "Portrait" else "L",
-            currency_symbol=currency_symbol,
-            grid=grid,
+            page_orientation=page_orientation,
+            grid_cols=grid_cols,
+            grid_rows=grid_rows,
+            currency_symbol=currency_symbol.strip() or "£",
             show_price=show_price,
             show_sku=show_sku,
             show_description=show_description,
             show_attributes=show_attributes,
-            include_brand=include_brand,
-            include_kashrut=include_kashrut,
-            category_mode="path" if categories else "name",
-            category_path_fn=path_name_fn if path_name_fn else (lambda x: ""),
-            progress_cb=lambda x: prog2(0.75 + 0.25 * x),
-            log_fn=log2,
+            exclude_oos=exclude_oos,
+            only_sale=only_sale,
+            include_private_in_pdf=include_private_in_pdf,
+            category_by_id=cat_by_id if isinstance(cat_by_id, dict) else None,
+            category_children=cat_children if isinstance(cat_children, dict) else None,
         )
 
-        # ensure Streamlit gets bytes
+        # ✅ Streamlit download_button MUST receive bytes (not bytearray)
         if isinstance(pdf_bytes, bytearray):
             pdf_bytes = bytes(pdf_bytes)
-        elif isinstance(pdf_bytes, str):
+        if isinstance(pdf_bytes, str):
             pdf_bytes = pdf_bytes.encode("latin-1", "ignore")
-        elif not isinstance(pdf_bytes, (bytes,)):
-            pdf_bytes = bytes(pdf_bytes)
 
+        progress.progress(1.0)
         status.success("PDF ready.")
 
+        fname = f"bkosher_catalog_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
         st.download_button(
             "Download PDF",
             data=pdf_bytes,
-            file_name=f"bkosher_catalog_{now_date_str().replace(' ', '_')}.pdf",
+            file_name=fname,
             mime="application/pdf",
         )
         st.caption("Tip: PDF links work best in Chrome/Edge PDF viewer.")
 
-    st.divider()
-    st.caption("If your iPhone browser sleeps, Streamlit may stop running. The cache makes reloading fast, and the API fetch avoids 'status=any' (which causes 500 on your site).")
+    st.markdown("---")
+    st.caption("Brand colours: Pantone 186C (red) + Pantone 2945C (blue).")
 
 
 if __name__ == "__main__":
