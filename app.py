@@ -1090,10 +1090,11 @@ def main():
     filtered = df.copy()
 
     # status filtering for PDF
-    if not include_private_in_pdf:
-        if "status" in filtered.columns:
-            filtered = filtered[filtered["status"].isin(["publish"])]
-
+if "status" in filtered.columns:
+    if include_private_in_pdf:
+        filtered = filtered[filtered["status"].isin(["publish", "private"])]
+    else:
+        filtered = filtered[filtered["status"].isin(["publish"])]
     if exclude_oos and "stock_status" in filtered.columns:
         filtered = filtered[filtered["stock_status"].astype(str).str.lower().isin(["instock", "onbackorder"])]
 
