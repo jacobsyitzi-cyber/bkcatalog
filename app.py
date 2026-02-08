@@ -890,7 +890,7 @@ def main():
             st.image(logo_bytes, use_column_width=True)
     with col2:
         st.markdown(f'<div class="bk-title">{DEFAULT_TITLE}</div>', unsafe_allow_html=True)
-        st.markdown('<div class="bk-sub">Default = WooCommerce API. CSV upload is a backup option.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="bk-sub">Default = WooCommerce API. CSV upload is a backup option121.</div>', unsafe_allow_html=True)
 
     st.divider()
 
