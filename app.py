@@ -487,7 +487,7 @@ class CatalogPDF(FPDF):
             lines.append(cur)
         if len(lines) == max_lines:
             last = lines[-1]
-            ell = "…"
+            ell = "..."
             while self.get_string_width(last + ell) > max_w and len(last) > 0:
                 last = last[:-1]
             lines[-1] = (last + ell).strip()
