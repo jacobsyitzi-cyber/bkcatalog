@@ -878,6 +878,7 @@ def load_api_creds_from_secrets() -> Optional[WooCreds]:
 
 
 def main():
+    st.caption("APP VERSION: 2026-02-08-PRIVATE-TOGGLE-V2")
     st.set_page_config(page_title="B-Kosher Catalog Builder", layout="wide")
     inject_brand_css()
     require_login()
