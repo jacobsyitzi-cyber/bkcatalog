@@ -2,35 +2,24 @@
 # - WooCommerce API (default) + CSV upload (backup)
 # - Login gate (password from secrets)
 # - Resumable API import with true totals + % progress + live logs
-# - Category tree selection (parents + children + grandchildren) + search + sale-only
-# - Include/exclude private products in *catalog filtering* (separate from API-load toggle)
+# - API page size = 100 (imports 100 products per request)
+# - Continuous progress (auto-refresh) while importing (no manual “press load” every time)
+# - Category tree selection (parents + children) + search + sale-only
+# - Include/exclude private products in *catalog filtering*
 # - PDF generator (fpdf2) with B-Kosher branding, clickable product tiles
 # - Grid density: Standard (3×3) or Compact (6×5) (no text overflow)
 # - Orientation: Portrait / Landscape (auto-tunes grid)
-# - API import improved: per_page=100 option + continuous progress + auto-continue
-# - PDF build improved: image prefetch with its own progress bar
+# - PDF build shows image prefetch progress (parallel downloads) + speeds PDF build
 #
 # Secrets supported (Streamlit Cloud -> Settings -> Secrets):
 #   APP_PASSWORD = "..."
-#
-# WooCommerce credentials (ANY ONE naming scheme works):
-#   WC_URL = "https://www.b-kosher.co.uk"
-#   WC_CK  = "ck_..."
-#   WC_CS  = "cs_..."
-#
-# OR:
-#   WC_BASE_URL = "https://www.b-kosher.co.uk"
-#   WC_CONSUMER_KEY = "ck_..."
-#   WC_CONSUMER_SECRET = "cs_..."
-#
-# OR legacy:
-#   WOOCOMMERCE_URL = "..."
+#   WC_URL = "https://www.b-kosher.co.uk"        (or WC_BASE_URL)
+#   WC_CK  = "ck_..."                           (or WC_CONSUMER_KEY)
+#   WC_CS  = "cs_..."                           (or WC_CONSUMER_SECRET)
 #
 # Notes:
-# - Streamlit Cloud will restart a script if it runs too long without yielding.
-#   We therefore fetch in chunks and auto-rerun until finished.
-# - iPhone backgrounding/sleep can pause the browser -> you may need to open the app again.
-#   The import RESUMES from cache; it does not restart.
+# - “Imports 150 then stops” was because 6 pages/run × 25 per_page = 150.
+#   Now per_page=100, and the importer auto-refreshes continuously until complete.
 
 from __future__ import annotations
 
@@ -38,12 +27,13 @@ import hashlib
 import html
 import io
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pandas as pd
 import requests
@@ -51,6 +41,10 @@ import streamlit as st
 from requests.auth import HTTPBasicAuth
 from fpdf import FPDF  # fpdf2
 
+# ----------------------------
+# Page config (must be first Streamlit call)
+# ----------------------------
+st.set_page_config(page_title="B-Kosher Catalog Builder", page_icon="🧾", layout="wide")
 
 # ----------------------------
 # Brand config
@@ -59,17 +53,20 @@ BRAND_NAME = "B-Kosher"
 DEFAULT_TITLE = "B-Kosher Product Catalog"
 BRAND_SITE = "www.b-kosher.co.uk"
 
-# Pantone screenshot provided:
 BRAND_RED = "#C8102E"
 BRAND_BLUE = "#004C97"
 
-# PDF layout
 PDF_MARGIN_MM = 10.0
 HEADER_H_MM = 14.0
 FOOTER_H_MM = 10.0
 CATEGORY_BAR_H_MM = 8.0
 
-# Cache dirs (Streamlit Cloud ephemeral but persists within container lifetime)
+# API behavior
+API_PER_PAGE = 100            # ✅ requested: 100 at once
+API_MAX_PAGES_PER_RUN = 4     # keep each run short to avoid Streamlit Cloud health-check timeouts
+API_RETRIES = 5
+
+# Cache dirs (Streamlit Cloud ephemeral but persists while container is alive)
 APP_DIR = Path(__file__).parent.resolve()
 CACHE_DIR = APP_DIR / ".cache"
 IMG_DIR = CACHE_DIR / "images"
@@ -78,10 +75,10 @@ CACHE_DIR.mkdir(exist_ok=True)
 IMG_DIR.mkdir(parents=True, exist_ok=True)
 API_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # ----------------------------
 # Utilities
 # ----------------------------
+
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     h = hex_color.strip().lstrip("#")
     return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -107,13 +104,9 @@ def sanitize_latin1(s: Any) -> str:
     s = s.replace("\u2013", "-").replace("\u2014", "-")
     s = s.replace("\xa0", " ")
 
-    # Strip HTML (defensive; descriptions sometimes leak tags)
-    s = re.sub(r"<[^>]+>", "", s)
-
-    # Clean stray control chars
+    # Clean control chars
     s = re.sub(r"[\x00-\x08\x0B-\x1F\x7F]", "", s)
 
-    # Finally enforce latin-1
     return s.encode("latin-1", "ignore").decode("latin-1")
 
 
@@ -151,6 +144,7 @@ def sha1_text(s: str) -> str:
 # ----------------------------
 # Logging (live logs panel)
 # ----------------------------
+
 def log(msg: str) -> None:
     st.session_state.setdefault("logs", [])
     st.session_state["logs"].append(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -165,19 +159,16 @@ def logs_text() -> str:
 # ----------------------------
 # Secrets + auth
 # ----------------------------
+
 def get_secret(key: str) -> Optional[str]:
     try:
-        v = st.secrets.get(key)  # type: ignore[attr-defined]
-        if v is None:
-            return None
-        s = str(v).strip()
-        return s if s else None
+        return st.secrets.get(key)  # type: ignore[attr-defined]
     except Exception:
         return None
 
 
 def get_wc_creds() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    # Support multiple secret key naming schemes
+    # Supports both your preferred naming and legacy naming
     url = (
         get_secret("WC_URL")
         or get_secret("WC_BASE_URL")
@@ -187,21 +178,22 @@ def get_wc_creds() -> Tuple[Optional[str], Optional[str], Optional[str]]:
     ck = (
         get_secret("WC_CK")
         or get_secret("WC_CONSUMER_KEY")
+        or get_secret("WC_KEY")
         or None
     )
     cs = (
         get_secret("WC_CS")
         or get_secret("WC_CONSUMER_SECRET")
+        or get_secret("WC_SECRET")
         or None
     )
     return url, ck, cs
 
 
 def require_login() -> None:
-    """Render login page and stop the app until authenticated."""
     app_pw = get_secret("APP_PASSWORD")
 
-    # If no password set, allow locally (but warn)
+    # If no password set, allow (but warn)
     if not app_pw:
         st.warning("APP_PASSWORD is not set in secrets. Login is disabled.")
         st.session_state["authed"] = True
@@ -210,16 +202,14 @@ def require_login() -> None:
     if st.session_state.get("authed"):
         return
 
-    st.set_page_config(page_title="B-Kosher Catalog Builder", page_icon="🧾", layout="wide")
     st.title("Login")
     st.caption("Enter the password to access the catalog builder.")
     pw = st.text_input("Password", type="password")
-
     if st.button("Login", use_container_width=True):
         if pw == app_pw:
             st.session_state["authed"] = True
             st.success("Logged in.")
-            time.sleep(0.2)
+            time.sleep(0.25)
             st.rerun()
         else:
             st.error("Wrong password.")
@@ -229,14 +219,14 @@ def require_login() -> None:
 # ----------------------------
 # Logo loader (local repo files)
 # ----------------------------
+
 def load_logo_bytes() -> Optional[bytes]:
     candidates = [
         APP_DIR / "B-kosher logo high q.png",
         APP_DIR / "Bkosher.png",
         APP_DIR / "bkosher.png",
-        APP_DIR / "bkosher.svg",
-        APP_DIR / "logo.png",
-        APP_DIR / "logo.jpg",
+        APP_DIR / "bkosher.jpg",
+        APP_DIR / "bkosher.jpeg",
     ]
     for p in candidates:
         if p.exists() and p.is_file():
@@ -248,15 +238,16 @@ def load_logo_bytes() -> Optional[bytes]:
 
 
 # ----------------------------
-# WooCommerce API fetcher (resumable)
+# WooCommerce API fetcher (resumable + continuous progress)
 # ----------------------------
+
 @dataclass
-class WCFetchResult:
-    products: List[dict]
-    categories: List[dict]
+class WCFetchMeta:
+    status: str
     total_products: int
     total_pages: int
-    used_status: str
+    last_completed_page: int
+    downloaded_count: int
 
 
 def wc_api_base(wc_url: str) -> str:
@@ -272,13 +263,12 @@ def wc_get_json(
     retries: int,
     backoff_base: float,
 ) -> Tuple[Optional[Any], Optional[requests.Response], Optional[str]]:
-    """Return (data, response, error_text). Never raises JSON decode errors."""
     last_err = None
     for attempt in range(1, retries + 1):
         try:
             r = session.get(url, params=params, auth=auth, timeout=timeout)
             if r.status_code != 200:
-                snippet = (r.text or "")[:500]
+                snippet = (r.text or "")[:800]
                 last_err = f"HTTP {r.status_code}: {snippet}"
                 log(f"⚠️ API error {r.status_code} (attempt {attempt}/{retries})")
             else:
@@ -302,42 +292,17 @@ def cache_paths_for(status_key: str) -> Tuple[Path, Path]:
     return meta, data
 
 
-def load_cached_products(status_key: str) -> Tuple[List[dict], dict]:
-    meta_path, data_path = cache_paths_for(status_key)
-    meta: dict = {}
-    items: List[dict] = []
-
+def read_meta(status_key: str) -> dict:
+    meta_path, _ = cache_paths_for(status_key)
     if meta_path.exists():
         try:
-            meta = json.loads(meta_path.read_text("utf-8"))
+            return json.loads(meta_path.read_text("utf-8"))
         except Exception:
-            meta = {}
-
-    if data_path.exists():
-        try:
-            with data_path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        items.append(json.loads(line))
-                    except Exception:
-                        continue
-        except Exception:
-            items = []
-
-    return items, meta
+            return {}
+    return {}
 
 
-def append_cached_products(status_key: str, new_items: List[dict]) -> None:
-    _, data_path = cache_paths_for(status_key)
-    with data_path.open("a", encoding="utf-8") as f:
-        for it in new_items:
-            f.write(json.dumps(it, ensure_ascii=False) + "\n")
-
-
-def save_cache_meta(status_key: str, meta: dict) -> None:
+def write_meta(status_key: str, meta: dict) -> None:
     meta_path, _ = cache_paths_for(status_key)
     meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), "utf-8")
 
@@ -350,43 +315,38 @@ def clear_cache(status_key: str) -> None:
         data_path.unlink()
 
 
-def fetch_all_categories(wc_url: str, ck: str, cs: str, timeout: int) -> List[dict]:
-    base = wc_api_base(wc_url)
-    session = requests.Session()
-    auth = HTTPBasicAuth(ck, cs)
+def append_products_jsonl(status_key: str, items: List[dict]) -> int:
+    _, data_path = cache_paths_for(status_key)
+    added = 0
+    with data_path.open("a", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+            added += 1
+    return added
 
-    cats: List[dict] = []
-    page = 1
-    per_page = 100
 
-    while True:
-        log(f"API: categories page {page}…")
-        data, _, err = wc_get_json(
-            session=session,
-            url=f"{base}/products/categories",
-            auth=auth,
-            params={"per_page": per_page, "page": page, "hide_empty": False},
-            timeout=timeout,
-            retries=5,
-            backoff_base=0.6,
-        )
-        if data is None:
-            raise RuntimeError(f"Failed to fetch categories: {err}")
-        if not isinstance(data, list):
-            raise RuntimeError("Unexpected categories payload.")
-        cats.extend(data)
-        if len(data) < per_page:
-            break
-        page += 1
-
-    log(f"Loaded {len(cats)} categories.")
-    return cats
+def load_all_products_jsonl(status_key: str) -> List[dict]:
+    _, data_path = cache_paths_for(status_key)
+    items: List[dict] = []
+    if not data_path.exists():
+        return items
+    with data_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(json.loads(line))
+            except Exception:
+                continue
+    return items
 
 
 def probe_totals(wc_url: str, ck: str, cs: str, timeout: int, status: str) -> Tuple[int, int]:
     base = wc_api_base(wc_url)
     session = requests.Session()
     auth = HTTPBasicAuth(ck, cs)
+
     r = session.get(
         f"{base}/products",
         params={"per_page": 1, "page": 1, "status": status},
@@ -399,25 +359,50 @@ def probe_totals(wc_url: str, ck: str, cs: str, timeout: int, status: str) -> Tu
     return total, pages
 
 
-def resumable_fetch_products(
+def fetch_all_categories(wc_url: str, ck: str, cs: str, timeout: int) -> List[dict]:
+    base = wc_api_base(wc_url)
+    session = requests.Session()
+    auth = HTTPBasicAuth(ck, cs)
+
+    cats: List[dict] = []
+    page = 1
+    per_page = 100
+    while True:
+        log(f"API: categories page {page}...")
+        data, _, err = wc_get_json(
+            session=session,
+            url=f"{base}/products/categories",
+            auth=auth,
+            params={"per_page": per_page, "page": page, "hide_empty": False},
+            timeout=timeout,
+            retries=4,
+            backoff_base=0.6,
+        )
+        if data is None:
+            raise RuntimeError(f"Failed to fetch categories: {err}")
+        if not isinstance(data, list):
+            raise RuntimeError("Unexpected categories payload.")
+        cats.extend(data)
+        if len(data) < per_page:
+            break
+        page += 1
+    log(f"Loaded {len(cats)} categories.")
+    return cats
+
+
+def fetch_products_chunk(
     wc_url: str,
     ck: str,
     cs: str,
     timeout: int,
     include_private: bool,
-    per_page: int,
-    max_pages_per_run: int,
-    retries: int = 6,
-) -> WCFetchResult:
+    per_page: int = API_PER_PAGE,
+    max_pages_per_run: int = API_MAX_PAGES_PER_RUN,
+    retries: int = API_RETRIES,
+) -> Tuple[WCFetchMeta, bool]:
     """
-    Resumable fetch using disk cache:
-      - meta stores last_completed_page, total_pages, total_products, status
-      - products stored in jsonl append-only
-
-    IMPORTANT:
-    - The previous “150 products then stops” was exactly: per_page=25 and max_pages_per_run=6.
-      This fetches 6 pages × 25 = 150 in one run, then waits for the next rerun.
-    - Here you can set per_page=100, and we auto-rerun until finished.
+    Fetch up to max_pages_per_run pages, append to jsonl, update meta.
+    Returns (meta, finished).
     """
     status = "any" if include_private else "publish"
     status_key = f"status_{status}"
@@ -425,10 +410,12 @@ def resumable_fetch_products(
     session = requests.Session()
     auth = HTTPBasicAuth(ck, cs)
 
-    cached_products, meta = load_cached_products(status_key)
-    last_page = int(meta.get("last_completed_page", 0) or 0)
+    meta = read_meta(status_key)
+
     total_products = int(meta.get("total_products", 0) or 0)
     total_pages = int(meta.get("total_pages", 0) or 0)
+    last_page = int(meta.get("last_completed_page", 0) or 0)
+    downloaded = int(meta.get("downloaded_count", 0) or 0)
 
     if total_products <= 0 or total_pages <= 0:
         log("Probing totals…")
@@ -438,37 +425,20 @@ def resumable_fetch_products(
         meta["total_pages"] = total_pages
         meta["status"] = status
         meta["created_utc"] = now_utc_str()
-        save_cache_meta(status_key, meta)
+        meta.setdefault("downloaded_count", 0)
+        meta.setdefault("last_completed_page", 0)
+        write_meta(status_key, meta)
         log(f"Total products={total_products:,} total pages={total_pages:,} (status={status})")
 
-    start_page = max(1, last_page + 1)
+    start_page = last_page + 1
+    if start_page < 1:
+        start_page = 1
 
-    # Continuous progress UI
-    progress_bar = st.progress(0.0)
-    count_line = st.empty()
-    pages_line = st.empty()
-
-    def render_progress(done_count: int, current_page: int) -> None:
-        denom = total_products if total_products > 0 else max(done_count, 1)
-        pct = min(done_count / denom, 1.0)
-        progress_bar.progress(pct)
-        count_line.markdown(
-            f"**Imported:** {done_count:,} / {total_products:,} products (**{pct*100:.1f}%**)"
-        )
-        pages_line.caption(f"Page {min(max(current_page,0), total_pages):,} / {total_pages:,} • per_page={per_page}")
-
-    render_progress(len(cached_products), last_page)
-
-    fetched_this_run = 0
+    fetched_pages = 0
     page = start_page
 
-    while page <= total_pages and fetched_this_run < max_pages_per_run:
-        if st.session_state.get("fetch_stop"):
-            log("Stop flag set — halting fetch loop.")
-            break
-
-        log(f"API: products page {page} (status={status})…")
-
+    while page <= total_pages and fetched_pages < max_pages_per_run:
+        log(f"API: products page {page} (per_page={per_page}, status={status})…")
         data, _, err = wc_get_json(
             session=session,
             url=f"{base}/products",
@@ -485,51 +455,50 @@ def resumable_fetch_products(
             meta["skipped_pages"].append(page)
             meta["last_completed_page"] = page
             meta["updated_utc"] = now_utc_str()
-            save_cache_meta(status_key, meta)
+            write_meta(status_key, meta)
             page += 1
-            fetched_this_run += 1
-            render_progress(len(cached_products), page - 1)
+            fetched_pages += 1
             continue
 
         if not isinstance(data, list):
             log(f"⚠️ Unexpected payload on page {page}; skipping")
             page += 1
-            fetched_this_run += 1
+            fetched_pages += 1
             continue
 
-        append_cached_products(status_key, data)
-        cached_products.extend(data)
+        added = append_products_jsonl(status_key, data)
+        downloaded += added
 
+        meta["downloaded_count"] = downloaded
         meta["last_completed_page"] = page
         meta["updated_utc"] = now_utc_str()
-        save_cache_meta(status_key, meta)
+        write_meta(status_key, meta)
 
-        fetched_this_run += 1
-        render_progress(len(cached_products), page)
+        fetched_pages += 1
         page += 1
+        time.sleep(0.12)
 
-        time.sleep(0.08)
-
-    cats = st.session_state.get("wc_categories") or []
-    return WCFetchResult(
-        products=cached_products,
-        categories=cats,
-        total_products=total_products,
-        total_pages=total_pages,
-        used_status=status,
+    # Build WCFetchMeta
+    out_meta = WCFetchMeta(
+        status=status,
+        total_products=int(meta.get("total_products", total_products) or total_products),
+        total_pages=int(meta.get("total_pages", total_pages) or total_pages),
+        last_completed_page=int(meta.get("last_completed_page", last_page) or last_page),
+        downloaded_count=int(meta.get("downloaded_count", downloaded) or downloaded),
     )
+
+    finished = out_meta.last_completed_page >= out_meta.total_pages and out_meta.total_pages > 0
+    return out_meta, finished
 
 
 # ----------------------------
 # Category tree helpers
 # ----------------------------
-def build_category_maps(
-    categories: List[dict],
-) -> Tuple[Dict[int, dict], Dict[int, List[int]], Dict[int, int]]:
+
+def build_category_maps(categories: List[dict]) -> Tuple[Dict[int, dict], Dict[int, List[int]], Dict[int, int]]:
     by_id: Dict[int, dict] = {}
     children: Dict[int, List[int]] = {}
     parent: Dict[int, int] = {}
-
     for c in categories:
         try:
             cid = int(c.get("id"))
@@ -539,10 +508,8 @@ def build_category_maps(
         pid = int(c.get("parent") or 0)
         parent[cid] = pid
         children.setdefault(pid, []).append(cid)
-
     for pid, kids in children.items():
         kids.sort(key=lambda k: sanitize_latin1(by_id.get(k, {}).get("name", "")).lower())
-
     return by_id, children, parent
 
 
@@ -574,6 +541,7 @@ def descendants(cid: int, children: Dict[int, List[int]]) -> Set[int]:
 # ----------------------------
 # CSV loader (backup)
 # ----------------------------
+
 def load_products_from_csv(file_bytes: bytes) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(file_bytes))
     col_map = {c.lower(): c for c in df.columns}
@@ -590,7 +558,6 @@ def load_products_from_csv(file_bytes: bytes) -> pd.DataFrame:
     out["categories_raw"] = df[col("Categories")] if col("Categories") else ""
     out["regular_price"] = df[col("Regular price")] if col("Regular price") else ""
     out["sale_price"] = df[col("Sale price")] if col("Sale price") else ""
-    out["in_stock"] = df[col("In stock?")] if col("In stock?") else ""
     out["published"] = df[col("Published")] if col("Published") else ""
     out["images_raw"] = df[col("Images")] if col("Images") else ""
     out["status"] = out["published"].apply(lambda x: "publish" if boolish(x) else "private")
@@ -605,12 +572,18 @@ def load_products_from_csv(file_bytes: bytes) -> pd.DataFrame:
 
     out["image_url"] = out["images_raw"].apply(first_img)
     out["permalink"] = ""
+    out["categories"] = [[] for _ in range(len(out))]
+    out["attributes"] = [[] for _ in range(len(out))]
+    out["images"] = [[] for _ in range(len(out))]
+    out["stock_status"] = ""
+    out["on_sale"] = False
     return out
 
 
 # ----------------------------
 # Product normalization (API -> dataframe)
 # ----------------------------
+
 def normalize_api_products(items: List[dict]) -> pd.DataFrame:
     rows = []
     for p in items:
@@ -641,7 +614,7 @@ def normalize_api_products(items: List[dict]) -> pd.DataFrame:
             if isinstance(images, list) and len(images) > 0:
                 return images[0].get("src") or ""
         except Exception:
-            return ""
+            pass
         return ""
 
     df["image_url"] = df["images"].apply(first_img)
@@ -652,7 +625,6 @@ def extract_brand_and_kashrut(attrs: Any) -> Tuple[str, str, str]:
     brand = ""
     kash = ""
     other_bits: List[str] = []
-
     if isinstance(attrs, list):
         for a in attrs:
             nm = sanitize_latin1(a.get("name", "")).strip()
@@ -662,7 +634,6 @@ def extract_brand_and_kashrut(attrs: Any) -> Tuple[str, str, str]:
             else:
                 v = sanitize_latin1(opts)
             nm_l = nm.lower()
-
             if nm_l in ("brand", "manufacturer"):
                 brand = v
             elif "kash" in nm_l or "kosher" in nm_l:
@@ -670,7 +641,6 @@ def extract_brand_and_kashrut(attrs: Any) -> Tuple[str, str, str]:
             else:
                 if nm and v:
                     other_bits.append(f"{nm}: {v}")
-
     attrs_text = " | ".join(other_bits[:2])
     return brand, kash, attrs_text
 
@@ -678,6 +648,7 @@ def extract_brand_and_kashrut(attrs: Any) -> Tuple[str, str, str]:
 # ----------------------------
 # Image download + caching
 # ----------------------------
+
 def image_cache_path(url: str) -> Path:
     ext = ".jpg"
     m = re.search(r"\.(png|jpg|jpeg|webp)(\?|$)", url.lower())
@@ -686,7 +657,7 @@ def image_cache_path(url: str) -> Path:
     return IMG_DIR / f"{sha1_text(url)}{ext}"
 
 
-def download_image_reliable(url: str, timeout: int = 25, retries: int = 6) -> Optional[Path]:
+def download_image_reliable(url: str, timeout: int = 18, retries: int = 3) -> Optional[Path]:
     if not url:
         return None
     path = image_cache_path(url)
@@ -703,60 +674,74 @@ def download_image_reliable(url: str, timeout: int = 25, retries: int = 6) -> Op
             log(f"⚠️ Image HTTP {r.status_code} (attempt {attempt}/{retries})")
         except requests.RequestException as e:
             log(f"⚠️ Image error (attempt {attempt}/{retries}): {e}")
-        time.sleep(0.55 * attempt)
+        time.sleep(0.4 * attempt)
     return None
 
 
-def prefetch_images_with_progress(df: pd.DataFrame, timeout: int = 25, retries: int = 6) -> None:
-    """Prefetch unique image URLs with its own progress bar."""
-    urls = [u for u in df.get("image_url", pd.Series([])).astype(str).tolist() if u and u != "nan"]
-    # keep only unique (preserve order)
+def prefetch_images_parallel(
+    df: pd.DataFrame,
+    max_workers: int = 16,
+    timeout: int = 18,
+    retries: int = 3,
+) -> Tuple[int, int]:
+    urls = [u for u in df.get("image_url", []).tolist() if isinstance(u, str) and u.strip()]
+
+    # Deduplicate (big win)
     seen = set()
-    uniq: List[str] = []
+    unique_urls = []
     for u in urls:
         if u not in seen:
             seen.add(u)
-            uniq.append(u)
+            unique_urls.append(u)
 
-    total = len(uniq)
+    total = len(unique_urls)
     if total == 0:
-        return
+        return 0, 0
 
-    st.subheader("Image download progress")
-    bar = st.progress(0.0)
-    line = st.empty()
-    cached = 0
-    downloaded = 0
+    pb = st.progress(0.0)
+    status = st.empty()
 
-    for i, u in enumerate(uniq, start=1):
-        p = image_cache_path(u)
-        if p.exists() and p.stat().st_size > 2_000:
-            cached += 1
-        else:
-            got = download_image_reliable(u, timeout=timeout, retries=retries)
-            if got:
-                downloaded += 1
-        pct = i / max(total, 1)
-        bar.progress(pct)
-        line.markdown(f"**Images:** {i:,} / {total:,}  •  cached {cached:,}  •  downloaded {downloaded:,}")
+    done = 0
+    ok = 0
 
-    log(f"Images prefetched: total={total} cached={cached} downloaded={downloaded}")
+    def worker(url: str) -> bool:
+        p = download_image_reliable(url, timeout=timeout, retries=retries)
+        return bool(p and Path(p).exists())
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(worker, u): u for u in unique_urls}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                if fut.result():
+                    ok += 1
+            except Exception:
+                pass
+
+            pb.progress(min(done / max(total, 1), 1.0))
+            status.markdown(f"**Images downloaded/cached:** {ok:,} / {total:,}  (**{(done/total)*100:.1f}% scanned**)")
+
+    status.success(f"Image prefetch complete: {ok:,}/{total:,} cached.")
+    return ok, total
 
 
 # ----------------------------
 # PDF builder (fpdf2)
 # ----------------------------
+
 class CatalogPDF(FPDF):
     def __init__(
         self,
         title_txt: str,
         orientation: str,
         show_site_footer: bool = True,
+        disclaimer: str = "",
         logo_bytes: Optional[bytes] = None,
     ):
         super().__init__(orientation=orientation, unit="mm", format="A4")
         self.title_txt = sanitize_latin1(title_txt)
         self.show_site_footer = show_site_footer
+        self.disclaimer = sanitize_latin1(disclaimer)
         self.logo_bytes = logo_bytes
 
         self.brand_red = hex_to_rgb(BRAND_RED)
@@ -797,12 +782,6 @@ class CatalogPDF(FPDF):
         self.set_line_width(0.6)
         self.line(PDF_MARGIN_MM, HEADER_H_MM + 6, self.w - PDF_MARGIN_MM, HEADER_H_MM + 6)
 
-        # Page number in header area
-        self.set_text_color(50, 50, 50)
-        self.set_font("Helvetica", "", 9)
-        self.set_xy(self.w - PDF_MARGIN_MM - 25, 8)
-        self.cell(25, 7, f"Page {self.page_no()}", align="R")
-
         self.set_text_color(0, 0, 0)
 
     def footer(self):
@@ -818,6 +797,11 @@ class CatalogPDF(FPDF):
         self.set_font("Helvetica", "", 8)
         left = sanitize_latin1(f"{BRAND_SITE} | Prices correct as of {time.strftime('%d %b %Y')}")
         self.cell(0, 6, left)
+
+        self.set_text_color(50, 50, 50)
+        self.set_font("Helvetica", "", 9)
+        self.set_xy(self.w - PDF_MARGIN_MM - 25, 8)
+        self.cell(25, 7, f"Page {self.page_no()}", align="R")
         self.set_text_color(0, 0, 0)
 
     def category_bar(self, text: str):
@@ -849,7 +833,6 @@ class CatalogPDF(FPDF):
         words = text.split()
         lines: List[str] = []
         cur = ""
-
         for w in words:
             test = (cur + " " + w).strip()
             if self.get_string_width(test) <= max_w or not cur:
@@ -859,18 +842,16 @@ class CatalogPDF(FPDF):
                 cur = w
                 if len(lines) >= max_lines:
                     break
-
         if len(lines) < max_lines and cur:
             lines.append(cur)
 
         if lines:
-            ell = "..."  # latin-1 safe
+            ell = "..."
             last = lines[-1]
             while self.get_string_width(last + ell) > max_w and len(last) > 1:
                 last = last[:-1]
             if last != lines[-1]:
                 lines[-1] = (last + ell).strip()
-
         return lines[:max_lines]
 
     def tile(
@@ -894,18 +875,18 @@ class CatalogPDF(FPDF):
 
         pad = 2.2 if dense else 2.8
 
-        # Image area
         img_h = h * (0.58 if dense else 0.62)
         img_x = x + pad
         img_y = y + pad
         img_w = w - 2 * pad
         img_box_h = img_h - pad
 
+        # ✅ IMPORTANT: do NOT download during PDF render (too slow)
         img_path = None
         if product.get("image_url"):
-            img_path = image_cache_path(product["image_url"])
-            if not img_path.exists() or img_path.stat().st_size <= 2_000:
-                img_path = None
+            p = image_cache_path(product["image_url"])
+            if p.exists():
+                img_path = p
 
         if img_path and Path(img_path).exists():
             try:
@@ -919,28 +900,27 @@ class CatalogPDF(FPDF):
             self.cell(img_w, 4, "No image", align="C")
             self.set_text_color(0, 0, 0)
 
-        # Sale badge
         on_sale = bool(product.get("on_sale")) or (
             money_2dp(product.get("sale_price")) is not None
             and money_2dp(product.get("regular_price")) is not None
-            and float(money_2dp(product.get("sale_price")) or 0) < float(money_2dp(product.get("regular_price")) or 0)
+            and float(money_2dp(product.get("sale_price")) or 0)
+            < float(money_2dp(product.get("regular_price")) or 0)
         )
         if on_sale:
             self.set_fill_color(*hex_to_rgb(BRAND_RED))
             self.set_text_color(255, 255, 255)
             self.set_font("Helvetica", "B", 7 if dense else 8)
-            bw, bh = ((14, 6) if dense else (16, 6.5))
+            bw, bh = (14, 6) if dense else (16, 6.5)
             self.rect(x + w - bw - 1.2, y + 1.2, bw, bh, style="F")
             self.set_xy(x + w - bw - 1.2, y + 1.2 + 1.0)
             self.cell(bw, bh - 2, "SALE", align="C")
             self.set_text_color(0, 0, 0)
 
-        # Text area
-        cursor_y = y + img_h
+        text_y = y + img_h
+        cursor_y = text_y
         max_w = w - 2 * pad
 
-        # Name
-        name_font = 7.2 if dense else 9.2
+        name_font = 7.3 if dense else 9.2
         name_lines = self.wrap_lines(
             product.get("name", ""),
             max_w=max_w,
@@ -955,7 +935,6 @@ class CatalogPDF(FPDF):
             self.cell(max_w, 3.6 if dense else 4.4, ln)
             cursor_y += 3.6 if dense else 4.4
 
-        # Price
         if show_price:
             sale = money_2dp(product.get("sale_price"))
             reg = money_2dp(product.get("regular_price"))
@@ -970,7 +949,6 @@ class CatalogPDF(FPDF):
                     self.set_font("Helvetica", "", 6.6 if dense else 8.0)
                     self.set_xy(x + pad + 16, cursor_y)
                     self.cell(max_w, 3.8 if dense else 4.3, f"{currency}{reg}")
-
                 self.set_text_color(0, 0, 0)
                 cursor_y += 3.9 if dense else 4.6
             else:
@@ -983,7 +961,6 @@ class CatalogPDF(FPDF):
                     self.set_text_color(0, 0, 0)
                     cursor_y += 3.9 if dense else 4.6
 
-        # SKU
         if show_sku and product.get("sku"):
             self.set_font("Helvetica", "", 6.2 if dense else 7.0)
             self.set_text_color(90, 90, 90)
@@ -994,26 +971,23 @@ class CatalogPDF(FPDF):
 
         brand, kash, attrs_text = extract_brand_and_kashrut(product.get("attributes"))
 
-        # Brand + Kashrut
         if show_brand_kashrut:
-            self.set_font("Helvetica", "", 6.2 if dense else 7.0)
-            self.set_text_color(70, 70, 70)
-
             if brand:
+                self.set_font("Helvetica", "", 6.2 if dense else 7.0)
+                self.set_text_color(70, 70, 70)
                 self.set_xy(x + pad, cursor_y)
                 self.cell(max_w, 3.1 if dense else 3.5, sanitize_latin1(f"Brand: {brand}"))
                 cursor_y += 3.1 if dense else 3.5
-
             if kash:
+                self.set_font("Helvetica", "", 6.2 if dense else 7.0)
+                self.set_text_color(70, 70, 70)
+                self.set_xy(x + pad, cursor_y)
                 ln = self.wrap_lines(f"Kashrus: {kash}", max_w, 1, "Helvetica", "", 6.2 if dense else 7.0)
                 if ln:
-                    self.set_xy(x + pad, cursor_y)
                     self.cell(max_w, 3.1 if dense else 3.5, ln[0])
                     cursor_y += 3.1 if dense else 3.5
-
             self.set_text_color(0, 0, 0)
 
-        # Attributes (short)
         if show_attrs and attrs_text:
             self.set_font("Helvetica", "", 6.0 if dense else 6.8)
             self.set_text_color(70, 70, 70)
@@ -1024,9 +998,9 @@ class CatalogPDF(FPDF):
                 cursor_y += 3.0 if dense else 3.4
             self.set_text_color(0, 0, 0)
 
-        # Description
         if show_desc:
             desc = product.get("short_description") or product.get("description") or ""
+            desc = re.sub("<[^>]+>", "", str(desc))
             desc = sanitize_latin1(desc).strip()
             if desc:
                 self.set_font("Helvetica", "", 5.8 if dense else 6.6)
@@ -1038,7 +1012,6 @@ class CatalogPDF(FPDF):
                     cursor_y += 2.8 if dense else 3.2
                 self.set_text_color(0, 0, 0)
 
-        # Clickable link over entire tile
         url = product.get("permalink") or ""
         if url:
             try:
@@ -1066,6 +1039,7 @@ def make_catalog_pdf_bytes(
         title_txt=title,
         orientation="P" if orientation == "Portrait" else "L",
         show_site_footer=True,
+        disclaimer="",
         logo_bytes=logo_b,
     )
     pdf.add_page()
@@ -1137,7 +1111,7 @@ def make_catalog_pdf_bytes(
 
         slot += 1
 
-    out = pdf.output(dest="S")  # fpdf2 returns bytearray in newer versions
+    out = pdf.output(dest="S")
     if isinstance(out, str):
         return out.encode("latin-1", "ignore")
     return bytes(out)
@@ -1146,8 +1120,9 @@ def make_catalog_pdf_bytes(
 # ----------------------------
 # App UI
 # ----------------------------
+
 def main():
-    st.set_page_config(page_title="B-Kosher Catalog Builder", page_icon="🧾", layout="wide")
+    require_login()
 
     # Header
     col1, col2 = st.columns([1, 5])
@@ -1159,11 +1134,11 @@ def main():
         st.title("B-Kosher Catalog Builder")
         st.caption("WooCommerce API is the default. CSV upload is a backup option.")
 
-    # Sidebar logs
+    # Sidebar: live logs
     with st.sidebar:
         st.subheader("Live logs")
         st.text_area("", value=logs_text(), height=420)
-        st.caption("If the import pauses (phone sleep/background), re-open the app and press “Continue importing” — it resumes from cache.")
+        st.caption("Importer auto-refreshes while running (no need to press load repeatedly).")
 
     wc_url, wc_ck, wc_cs = get_wc_creds()
 
@@ -1171,71 +1146,59 @@ def main():
     st.header("Step 1 — Choose data source")
     source = st.radio("Source", ["WooCommerce API", "CSV Upload"], index=0, horizontal=True)
 
+    # ---------------------------
+    # API SOURCE
+    # ---------------------------
     if source == "WooCommerce API":
         st.header("Step 2 — Load products (API)")
 
-        if not wc_url or not wc_ck or not wc_cs:
-            st.error(
-                "WooCommerce API secrets missing.\n\n"
-                "Add ONE of these sets to Streamlit Secrets:\n"
-                "- WC_URL, WC_CK, WC_CS\n"
-                "- WC_BASE_URL, WC_CONSUMER_KEY, WC_CONSUMER_SECRET"
-            )
-            st.stop()
-
         timeout = int(st.slider("API timeout (seconds)", 10, 60, 30))
         include_private_load = st.checkbox(
-            "Include private/unpublished products while LOADING (API status=any)",
+            "Include private/unpublished products (requires permission)",
             value=False,
-            help="If your API user lacks permission for private products, the server may return errors.",
+            help="Uses status=any if enabled, otherwise status=publish.",
         )
 
-        # NEW: per_page=100 option + chunk size control (keeps app alive)
-        per_page = st.selectbox("Products per API page", [25, 50, 100], index=2)
-        max_pages_per_run = st.slider(
-            "Pages per run (auto-continues until done)",
-            min_value=1,
-            max_value=30,
-            value=3,  # safe default; auto-rerun keeps it continuous
-            help="Higher = faster per click, but too high can trigger Streamlit Cloud timeouts.",
-        )
+        # Validate secrets
+        if not wc_url or not wc_ck or not wc_cs:
+            st.error("WooCommerce API secrets missing. Add WC_URL/WC_BASE_URL, WC_CK/WC_CONSUMER_KEY, WC_CS/WC_CONSUMER_SECRET to secrets.")
+            st.stop()
 
-        colA, colB, colC, colD = st.columns([1, 1, 1, 1])
+        status = "any" if include_private_load else "publish"
+        status_key = f"status_{status}"
+
+        colA, colB, colC = st.columns([1, 1, 1])
         with colA:
-            start_btn = st.button("Start importing (auto-continue)", use_container_width=True)
+            start_btn = st.button("Start / Continue import", use_container_width=True)
         with colB:
-            cont_btn = st.button("Continue importing", use_container_width=True)
-        with colC:
             refresh_btn = st.button("Refresh cache (start over)", use_container_width=True)
-        with colD:
+        with colC:
             stop_btn = st.button("Stop importing", use_container_width=True)
-
-        if stop_btn:
-            st.session_state["fetch_stop"] = True
-            st.session_state["auto_continue_import"] = False
-            log("Stop requested.")
-
-        status_key = f"status_{'any' if include_private_load else 'publish'}"
 
         if refresh_btn:
             clear_cache(status_key)
             st.session_state.pop("wc_products_df", None)
             st.session_state.pop("wc_categories", None)
-            st.session_state["fetch_stop"] = False
-            st.session_state["auto_continue_import"] = False
+            st.session_state["importing"] = False
             log("Cache cleared for this mode.")
 
+        if stop_btn:
+            st.session_state["importing"] = False
+            log("Stop requested.")
+
         if start_btn:
-            st.session_state["fetch_stop"] = False
-            st.session_state["auto_continue_import"] = True
+            st.session_state["importing"] = True
+            log("Import started/continued.")
 
-        if cont_btn:
-            st.session_state["fetch_stop"] = False
-            # continue exactly one chunk (and if auto_continue_import=True it keeps going)
-            st.session_state.setdefault("auto_continue_import", False)
+        # Always show progress from meta (continuous)
+        meta = read_meta(status_key)
+        total_products = int(meta.get("total_products", 0) or 0)
+        total_pages = int(meta.get("total_pages", 0) or 0)
+        last_page = int(meta.get("last_completed_page", 0) or 0)
+        downloaded = int(meta.get("downloaded_count", 0) or 0)
 
-        # Always ensure categories are loaded before importing products
-        if (st.session_state.get("auto_continue_import") or cont_btn) and not st.session_state.get("wc_categories"):
+        # Fetch categories once
+        if st.session_state.get("importing") and not st.session_state.get("wc_categories"):
             st.info("Loading categories…")
             log("Loading categories…")
             try:
@@ -1243,50 +1206,73 @@ def main():
                 st.session_state["wc_categories"] = cats
             except Exception as e:
                 st.error(f"Failed to load categories: {e}")
+                st.session_state["importing"] = False
                 st.stop()
 
-        # Run one import chunk if asked
-        if st.session_state.get("auto_continue_import") or cont_btn:
+        # Do a chunk fetch if importing
+        finished = False
+        if st.session_state.get("importing"):
+            pb = st.progress(0.0)
+            line1 = st.empty()
+            line2 = st.empty()
+
+            # If totals not known yet, show “starting…”
+            if total_products <= 0 or total_pages <= 0:
+                line1.markdown("**Imported:** 0 / ?")
+                line2.caption("Probing totals…")
+
             try:
-                res = resumable_fetch_products(
+                m, finished = fetch_products_chunk(
                     wc_url=wc_url,
                     ck=wc_ck,
                     cs=wc_cs,
                     timeout=timeout,
                     include_private=include_private_load,
-                    per_page=int(per_page),
-                    max_pages_per_run=int(max_pages_per_run),
-                    retries=6,
+                    per_page=API_PER_PAGE,                 # ✅ 100 at once
+                    max_pages_per_run=API_MAX_PAGES_PER_RUN,
+                    retries=API_RETRIES,
                 )
-                df = normalize_api_products(res.products)
-                st.session_state["wc_products_df"] = df
-                st.success(f"Cached: {len(df):,} products (status used: {res.used_status}).")
+                # Render progress
+                denom = m.total_products if m.total_products > 0 else max(m.downloaded_count, 1)
+                pct = min(m.downloaded_count / denom, 1.0)
+                pb.progress(pct)
+                line1.markdown(f"**Imported:** {m.downloaded_count:,} / {m.total_products:,} products (**{pct*100:.1f}%**)")
+                line2.caption(f"Page {min(m.last_completed_page, m.total_pages):,} / {m.total_pages:,}   |   per_page={API_PER_PAGE}")
+
+                if finished:
+                    st.session_state["importing"] = False
+                    log("✅ Import finished.")
+                    st.success(f"Import complete: {m.downloaded_count:,} products cached.")
             except Exception as e:
+                st.session_state["importing"] = False
                 st.error(str(e))
-                st.session_state["auto_continue_import"] = False
                 st.stop()
 
-            # Auto-continue until done
-            _, meta = load_cached_products(status_key)
-            last = int(meta.get("last_completed_page", 0) or 0)
-            total_pages = int(meta.get("total_pages", 0) or 0)
+            # ✅ Continuous progress: auto-refresh until done
+            if st.session_state.get("importing") and not finished:
+                st.info("Import in progress… auto-refreshing.")
+                st.autorefresh(interval=1200, key=f"autoimport_{status_key}")
 
-            if st.session_state.get("auto_continue_import") and not st.session_state.get("fetch_stop"):
-                if total_pages > 0 and last < total_pages:
-                    st.info("Auto-continuing… (the app will refresh itself while importing)")
-                    time.sleep(0.25)
-                    st.rerun()
-                else:
-                    st.session_state["auto_continue_import"] = False
-                    st.success("Import complete.")
+        # Load dataframe only when finished (fast UI while importing)
+        meta = read_meta(status_key)
+        total_pages = int(meta.get("total_pages", 0) or 0)
+        last_page = int(meta.get("last_completed_page", 0) or 0)
+        is_done = total_pages > 0 and last_page >= total_pages and not st.session_state.get("importing")
 
-        df_loaded = st.session_state.get("wc_products_df")
-        if df_loaded is None:
-            st.info("Press **Start importing (auto-continue)** to begin.")
+        if not is_done:
+            st.warning("Import is not finished yet. Leave this page open and it will keep importing.")
             st.stop()
 
+        # Build df from cached jsonl
+        items = load_all_products_jsonl(status_key)
+        df_loaded = normalize_api_products(items)
+        st.session_state["wc_products_df"] = df_loaded
         products_df = df_loaded
+        st.success(f"Loaded {len(products_df):,} products from cache (status={status}).")
 
+    # ---------------------------
+    # CSV SOURCE
+    # ---------------------------
     else:
         st.header("Step 2 — Load products (CSV)")
         up = st.file_uploader("Upload WooCommerce product export (.csv)", type=["csv"])
@@ -1297,7 +1283,9 @@ def main():
         st.session_state["wc_products_df"] = products_df
         st.success(f"Loaded {len(products_df):,} products from CSV.")
 
-    # Step 3
+    # ---------------------------------
+    # Step 3 — Filters and options
+    # ---------------------------------
     st.header("Step 3 — Choose what goes into the catalog")
 
     col1, col2, col3 = st.columns([1, 1, 1])
@@ -1317,23 +1305,22 @@ def main():
         exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
         only_sale = st.checkbox("Only sale items", value=False)
     with col5:
-        # IMPORTANT: the checkbox you said you could not see — keep it very visible
         include_private_in_pdf = st.checkbox(
-            "Include private/unpublished products in catalog (PDF)",
+            "Include private/unpublished products in catalog",
             value=False,
-            help="This filter applies after loading. If you did not load private products from API, turning this on cannot add them.",
+            help="Applies at catalog filtering stage. If you did not import private products from API, enabling this will not add them.",
         )
     with col6:
         category_label_mode = st.selectbox("Category divider label", ["Full path", "Top level"], index=0)
 
     title = st.text_input("Catalog title", value=DEFAULT_TITLE)
 
-    # Category selection
+    # ---- Category selection (tree) ----
     cats = st.session_state.get("wc_categories") or []
     by_id, children, parent = build_category_maps(cats) if cats else ({}, {}, {})
     paths: List[Tuple[str, int]] = []
-
     expanded: Set[int] = set()
+
     if by_id:
         for cid in by_id.keys():
             paths.append((category_path(cid, by_id, parent), cid))
@@ -1341,32 +1328,34 @@ def main():
 
         st.subheader("Categories (tree)")
         selected_paths = st.multiselect(
-            "Choose categories (selecting a parent includes all children & grandchildren)",
+            "Choose categories (parents work too — selecting a parent includes all children)",
             options=[p for p, _ in paths],
             default=[],
         )
-        selected_ids = [cid for p, cid in paths if p in set(selected_paths)]
+        selected_set = set(selected_paths)
+        selected_ids = [cid for p, cid in paths if p in selected_set]
         for cid in selected_ids:
             expanded.add(cid)
             expanded |= descendants(cid, children)
     else:
         st.subheader("Categories")
-        st.caption("CSV mode does not include a category tree; category filtering is limited.")
+        expanded = set()
 
     search = st.text_input("Search (name or SKU)", value="")
 
-    # Apply filters
+    # ---- Apply filters ----
     df = products_df.copy()
     df["name"] = df["name"].astype(str).map(safe_unescape)
     df["sku"] = df.get("sku", "").astype(str).fillna("")
 
-    if exclude_oos:
-        if "stock_status" in df.columns:
-            df = df[df["stock_status"].astype(str).str.lower().eq("instock")]
+    if exclude_oos and "stock_status" in df.columns:
+        df = df[df["stock_status"].astype(str).str.lower().eq("instock")]
 
+    # Private filter
     if not include_private_in_pdf and "status" in df.columns:
         df = df[df["status"].astype(str).str.lower().eq("publish")]
 
+    # Sale-only
     if only_sale:
         def is_sale_row(r: pd.Series) -> bool:
             sp = money_2dp(r.get("sale_price"))
@@ -1438,11 +1427,12 @@ def main():
         df["category_path_best"] = df.get("categories_raw", "")
         df["category_top"] = df.get("categories_raw", "")
 
+    # Search
     if search.strip():
         q = search.strip().lower()
         df = df[
-            df["name"].astype(str).str.lower().str.contains(q, na=False)
-            | df["sku"].astype(str).str.lower().str.contains(q, na=False)
+            df["name"].astype(str).str.lower().str.contains(q)
+            | df["sku"].astype(str).str.lower().str.contains(q)
         ]
 
     st.info(f"Selected products: **{len(df):,}**")
@@ -1456,34 +1446,37 @@ def main():
             cols.append("status")
         st.dataframe(prev[cols], use_container_width=True)
 
-    # Step 4 — PDF
+    # ---------------------------------
+    # Step 4 — Generate PDF
+    # ---------------------------------
     st.header("Step 4 — Generate PDF")
+
+    st.subheader("Image downloads (recommended for large catalogs)")
+    max_workers = st.slider("Image download workers", 4, 40, 16)
+    do_prefetch = st.checkbox("Prefetch images in parallel before building PDF", value=True)
 
     if st.button("Generate PDF", type="primary", use_container_width=True):
         if len(df) == 0:
             st.error("No products selected.")
             st.stop()
 
-        dense = grid_mode.startswith("Compact")
-        grid_key = "Compact" if dense else "Standard"
+        grid_key = "Standard" if grid_mode.startswith("Standard") else "Compact"
+        dense = (grid_key == "Compact")
 
-        log("Prefetching images…")
-        st.info("Stage 1/2 — Downloading images…")
-        prefetch_images_with_progress(df, timeout=25, retries=6)
+        if do_prefetch:
+            log(f"Prefetching images with {max_workers} workers…")
+            st.info("Stage 1/2 — Downloading images in parallel…")
+            prefetch_images_parallel(df, max_workers=max_workers, timeout=18, retries=3)
 
-        log("Generating PDF…")
         st.info("Stage 2/2 — Building PDF…")
-        build_bar = st.progress(0.0)
-        status = st.empty()
-        status.info("Building PDF…")
-        build_bar.progress(0.2)
+        log("Generating PDF…")
 
         pdf_bytes = make_catalog_pdf_bytes(
             df=df,
             title=title,
             orientation=orientation,
             currency=currency,
-            grid_mode=grid_key,
+            grid_mode=("Compact" if dense else "Standard"),
             show_price=show_price,
             show_sku=show_sku,
             show_desc=show_desc,
@@ -1492,9 +1485,7 @@ def main():
             category_label_mode=category_label_mode,
         )
 
-        build_bar.progress(1.0)
-        status.success("PDF ready.")
-
+        # Ensure true bytes
         if isinstance(pdf_bytes, bytearray):
             pdf_bytes = bytes(pdf_bytes)
         elif isinstance(pdf_bytes, str):
@@ -1502,6 +1493,7 @@ def main():
         elif not isinstance(pdf_bytes, (bytes,)):
             pdf_bytes = bytes(pdf_bytes)
 
+        st.success("PDF ready.")
         st.download_button(
             "Download PDF",
             data=pdf_bytes,
@@ -1514,8 +1506,5 @@ def main():
     st.caption("Done.")
 
 
-# ----------------------------
-# Boot
-# ----------------------------
-require_login()
-main()
+if __name__ == "__main__":
+    main()
