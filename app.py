@@ -733,7 +733,7 @@ def prefetch_images_with_progress_parallel(
         return download_image_reliable(u, timeout=timeout, retries=retries) is not None
 
     # Cap workers a bit to avoid Cloudflare / origin rate limits
-    workers = max(4, min(int(workers), 32))
+    workers = max(4, min(int(workers), 132))
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(worker, u): u for u in to_get}
@@ -1537,7 +1537,7 @@ def main():
     chunk_size = st.slider("Products per PDF (when Huge selection mode is on)", 200, 1500, 800, step=100)
 
     # Image prefetch tuning
-    workers = st.slider("Image download workers (parallel)", 4, 32, 16)
+    workers = st.slider("Image download workers (parallel)", 4, 132, 80)
 
     if st.button("Generate PDF", type="primary", use_container_width=True):
         if len(df) == 0:
