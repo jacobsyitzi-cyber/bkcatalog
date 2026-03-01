@@ -8,7 +8,10 @@
 # - Grid density: Standard (3×3) or Compact (6×5) (no text overflow)
 # - Orientation: Portrait / Landscape (auto-tunes grid)
 # - API import improved: per_page=100 option + continuous progress + auto-continue
-# - PDF build improved: image prefetch with its own progress bar
+# - PDF build improved:
+#     - MUCH faster concurrent image prefetch (configurable workers)
+#     - PDF build progress bar
+#     - Large builds: automatic multi-part PDFs + ZIP download (prevents crashes)
 #
 # Secrets supported (Streamlit Cloud -> Settings -> Secrets):
 #   APP_PASSWORD = "..."
@@ -41,11 +44,11 @@ import io
 import json
 import os
 import re
-import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Callable
 
 import pandas as pd
 import requests
@@ -678,7 +681,7 @@ def extract_brand_and_kashrut(attrs: Any) -> Tuple[str, str, str]:
 
 
 # ----------------------------
-# Image download + caching
+# Image download + caching (FAST)
 # ----------------------------
 def image_cache_path(url: str) -> Path:
     ext = ".jpg"
@@ -695,6 +698,7 @@ def download_image_reliable(url: str, timeout: int = 25, retries: int = 6) -> Op
     if path.exists() and path.stat().st_size > 2_000:
         return path
 
+    # local session per call (safe with threads)
     session = requests.Session()
     for attempt in range(1, retries + 1):
         try:
@@ -709,18 +713,15 @@ def download_image_reliable(url: str, timeout: int = 25, retries: int = 6) -> Op
     return None
 
 
-def prefetch_images_with_progress(df: pd.DataFrame, timeout: int = 25, retries: int = 6) -> None:
-    """
-    Prefetch unique image URLs with its own progress bar.
-
-    CHANGED SECTION (speed):
-    - Downloads concurrently (thread pool), instead of strictly one-by-one.
-    - Still respects cache (skips files already downloaded).
-    - Uses a per-thread requests.Session for keep-alive without thread-safety issues.
-    """
-    # Pull URLs (keep only non-empty)
+def prefetch_images_with_progress(
+    df: pd.DataFrame,
+    timeout: int = 25,
+    retries: int = 6,
+    max_workers: int = 16,
+) -> None:
+    """Prefetch unique image URLs concurrently with its own progress bar."""
     urls = [u for u in df.get("image_url", pd.Series([])).astype(str).tolist() if u and u != "nan"]
-    # Unique (preserve order)
+    # unique (preserve order)
     seen = set()
     uniq: List[str] = []
     for u in urls:
@@ -732,9 +733,13 @@ def prefetch_images_with_progress(df: pd.DataFrame, timeout: int = 25, retries: 
     if total == 0:
         return
 
-    # Count how many are already cached
-    to_fetch: List[str] = []
+    st.subheader("Image download progress")
+    bar = st.progress(0.0)
+    line = st.empty()
+
+    # pre-count cached
     cached = 0
+    to_fetch: List[str] = []
     for u in uniq:
         p = image_cache_path(u)
         if p.exists() and p.stat().st_size > 2_000:
@@ -742,98 +747,50 @@ def prefetch_images_with_progress(df: pd.DataFrame, timeout: int = 25, retries: 
         else:
             to_fetch.append(u)
 
-    st.subheader("Image download progress")
-    bar = st.progress(0.0)
-    line = st.empty()
+    done = 0
+    downloaded = 0
+    failed = 0
 
-    # If everything is cached, just show quick completion
+    # immediate UI update
+    done = cached
+    bar.progress(done / max(total, 1))
+    line.markdown(
+        f"**Images:** {done:,} / {total:,}  •  cached {cached:,}  •  downloaded {downloaded:,}  •  failed {failed:,}"
+    )
+
     if not to_fetch:
-        bar.progress(1.0)
-        line.markdown(f"**Images:** {total:,} / {total:,}  •  cached {cached:,}  •  downloaded 0")
-        log(f"Images prefetched: total={total} cached={cached} downloaded=0")
+        log(f"Images prefetched: total={total} cached={cached} downloaded=0 failed=0")
         return
 
-    # Tune concurrency (safe defaults for Streamlit Cloud + avoid hammering server)
-    # You can adjust these if needed later, but keeping as fixed constants (no UI changes).
-    MAX_WORKERS = 16
-    MAX_INFLIGHT = 64  # soft cap to avoid huge memory usage
+    # cap workers (too many can annoy the host/CDN)
+    workers = max(2, min(int(max_workers), 32))
 
-    # Per-thread session
-    _tls = threading.local()
+    def task(u: str) -> bool:
+        p = download_image_reliable(u, timeout=timeout, retries=retries)
+        return bool(p)
 
-    def _get_session() -> requests.Session:
-        s = getattr(_tls, "session", None)
-        if s is None:
-            s = requests.Session()
-            # Some hosts behave better with a UA
-            s.headers.update({"User-Agent": "B-KosherCatalogBuilder/1.0"})
-            _tls.session = s
-        return s
-
-    def _download_one(url: str) -> bool:
-        """Return True if downloaded (or already cached by the time we got here)."""
-        path = image_cache_path(url)
-        if path.exists() and path.stat().st_size > 2_000:
-            return False  # counted as cached earlier; but ok
-        sess = _get_session()
-        last_err = None
-        for attempt in range(1, retries + 1):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(task, u) for u in to_fetch]
+        for fut in concurrent.futures.as_completed(futures):
+            ok = False
             try:
-                r = sess.get(url, timeout=timeout)
-                if r.status_code == 200 and r.content and len(r.content) > 1_000:
-                    path.write_bytes(r.content)
-                    return True
-                last_err = f"HTTP {r.status_code}"
-            except requests.RequestException as e:
-                last_err = str(e)
-            time.sleep(0.25 * attempt)
-        # don't spam logs per-image; just return
-        return False
+                ok = bool(fut.result())
+            except Exception:
+                ok = False
 
-    downloaded = 0
-    processed = cached  # cached already “done”
-    total_all = total
+            done += 1
+            if ok:
+                downloaded += 1
+            else:
+                failed += 1
 
-    # Start pool and update progress as futures complete
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        # Submit in small waves (keeps memory bounded)
-        idx = 0
-        inflight: Set[concurrent.futures.Future] = set()
-
-        def _render() -> None:
-            pct = min(processed / max(total_all, 1), 1.0)
-            bar.progress(pct)
+            # update UI
+            bar.progress(min(done / max(total, 1), 1.0))
             line.markdown(
-                f"**Images:** {processed:,} / {total_all:,}  •  cached {cached:,}  •  downloaded {downloaded:,}"
+                f"**Images:** {done:,} / {total:,}  •  cached {cached:,}  •  downloaded {downloaded:,}  •  failed {failed:,}  •  workers {workers}"
             )
 
-        _render()
-
-        while idx < len(to_fetch) or inflight:
-            # Fill inflight up to cap
-            while idx < len(to_fetch) and len(inflight) < MAX_INFLIGHT:
-                inflight.add(ex.submit(_download_one, to_fetch[idx]))
-                idx += 1
-
-            # Wait for at least one completion
-            done, inflight = concurrent.futures.wait(
-                inflight,
-                timeout=0.5,
-                return_when=concurrent.futures.FIRST_COMPLETED,
-            )
-
-            # Process completions
-            for fut in done:
-                try:
-                    ok = bool(fut.result())
-                except Exception:
-                    ok = False
-                if ok:
-                    downloaded += 1
-                processed += 1
-            _render()
-
-    log(f"Images prefetched: total={total_all} cached={cached} downloaded={downloaded}")
+    log(f"Images prefetched: total={total} cached={cached} downloaded={downloaded} failed={failed} workers={workers}")
 
 
 # ----------------------------
@@ -1152,6 +1109,7 @@ def make_catalog_pdf_bytes(
     show_attrs: bool,
     show_brand_kashrut: bool,
     category_label_mode: str,
+    progress_hook: Optional[Callable[[int, int], None]] = None,  # (done, total)
 ) -> bytes:
     logo_b = load_logo_bytes()
 
@@ -1192,6 +1150,9 @@ def make_catalog_pdf_bytes(
     current_group = None
     slot = 0
 
+    total_rows = int(len(df2))
+    done_rows = 0
+
     for _, row in df2.iterrows():
         g = sanitize_latin1(row.get("group_label") or "Uncategorised")
         if g != current_group:
@@ -1229,11 +1190,81 @@ def make_catalog_pdf_bytes(
         )
 
         slot += 1
+        done_rows += 1
+        if progress_hook and (done_rows == 1 or done_rows % 25 == 0 or done_rows == total_rows):
+            progress_hook(done_rows, total_rows)
 
     out = pdf.output(dest="S")  # fpdf2 returns bytearray in newer versions
     if isinstance(out, str):
         return out.encode("latin-1", "ignore")
     return bytes(out)
+
+
+def build_pdf_parts_as_zip(
+    df: pd.DataFrame,
+    title: str,
+    orientation: str,
+    currency: str,
+    grid_mode: str,
+    show_price: bool,
+    show_sku: bool,
+    show_desc: bool,
+    show_attrs: bool,
+    show_brand_kashrut: bool,
+    category_label_mode: str,
+    chunk_size: int,
+) -> Tuple[bytes, List[str]]:
+    """
+    Build multiple PDF parts and return (zip_bytes, filenames).
+    This avoids crashes when df is huge (e.g. 8k–10k products).
+    """
+    zip_buf = io.BytesIO()
+    filenames: List[str] = []
+
+    with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        total = int(len(df))
+        if total <= 0:
+            return b"", []
+
+        # keep stable order as already filtered/sorted by the UI
+        num_parts = (total + chunk_size - 1) // chunk_size
+
+        built = 0
+        for part_idx in range(num_parts):
+            start = part_idx * chunk_size
+            end = min((part_idx + 1) * chunk_size, total)
+            part_df = df.iloc[start:end].copy()
+
+            # progress hook for this part
+            def hook(done_in_part: int, total_in_part: int) -> None:
+                nonlocal built
+                # done overall = already built in previous parts + done in this part
+                overall_done = start + done_in_part
+                built = max(built, overall_done)
+                st.session_state["pdf_build_done"] = built
+                st.session_state["pdf_build_total"] = total
+
+            part_bytes = make_catalog_pdf_bytes(
+                df=part_df,
+                title=f"{title} (Part {part_idx+1} of {num_parts})",
+                orientation=orientation,
+                currency=currency,
+                grid_mode=grid_mode,
+                show_price=show_price,
+                show_sku=show_sku,
+                show_desc=show_desc,
+                show_attrs=show_attrs,
+                show_brand_kashrut=show_brand_kashrut,
+                category_label_mode=category_label_mode,
+                progress_hook=hook,
+            )
+
+            fname = f"bkosher_catalog_part_{part_idx+1:02d}_of_{num_parts:02d}.pdf"
+            filenames.append(fname)
+            zf.writestr(fname, part_bytes)
+
+    zip_buf.seek(0)
+    return zip_buf.getvalue(), filenames
 
 
 # ----------------------------
@@ -1283,13 +1314,12 @@ def main():
             help="If your API user lacks permission for private products, the server may return errors.",
         )
 
-        # NEW: per_page=100 option + chunk size control (keeps app alive)
         per_page = st.selectbox("Products per API page", [25, 50, 100], index=2)
         max_pages_per_run = st.slider(
             "Pages per run (auto-continues until done)",
             min_value=1,
             max_value=30,
-            value=3,  # safe default; auto-rerun keeps it continuous
+            value=3,
             help="Higher = faster per click, but too high can trigger Streamlit Cloud timeouts.",
         )
 
@@ -1324,7 +1354,6 @@ def main():
 
         if cont_btn:
             st.session_state["fetch_stop"] = False
-            # continue exactly one chunk (and if auto_continue_import=True it keeps going)
             st.session_state.setdefault("auto_continue_import", False)
 
         # Always ensure categories are loaded before importing products
@@ -1410,7 +1439,6 @@ def main():
         exclude_oos = st.checkbox("Exclude out-of-stock", value=True)
         only_sale = st.checkbox("Only sale items", value=False)
     with col5:
-        # IMPORTANT: the checkbox you said you could not see — keep it very visible
         include_private_in_pdf = st.checkbox(
             "Include private/unpublished products in catalog (PDF)",
             value=False,
@@ -1502,9 +1530,9 @@ def main():
             except Exception:
                 return ""
             cur = cid
-            seen = set()
-            while cur and cur not in seen:
-                seen.add(cur)
+            seen2 = set()
+            while cur and cur not in seen2:
+                seen2.add(cur)
                 p = parent.get(cur, 0)
                 if p == 0:
                     break
@@ -1552,6 +1580,18 @@ def main():
     # Step 4 — PDF
     st.header("Step 4 — Generate PDF")
 
+    # controls that affect performance / stability (kept simple)
+    with st.expander("PDF performance options", expanded=False):
+        img_workers = st.slider("Image download workers (faster = higher)", 2, 32, 16)
+        pdf_chunk_size = st.number_input(
+            "Max products per PDF part (large catalogs auto-split)",
+            min_value=200,
+            max_value=5000,
+            value=1200,
+            step=100,
+            help="If you select 8000 products, this will create ~8000/1200 ≈ 7 PDFs in a ZIP.",
+        )
+
     if st.button("Generate PDF", type="primary", use_container_width=True):
         if len(df) == 0:
             st.error("No products selected.")
@@ -1560,49 +1600,102 @@ def main():
         dense = grid_mode.startswith("Compact")
         grid_key = "Compact" if dense else "Standard"
 
+        # Stage 1/2 — images (fast concurrent)
         log("Prefetching images…")
         st.info("Stage 1/2 — Downloading images…")
-        prefetch_images_with_progress(df, timeout=25, retries=6)
+        prefetch_images_with_progress(df, timeout=25, retries=6, max_workers=int(img_workers))
 
-        log("Generating PDF…")
+        # Stage 2/2 — build PDF(s) with progress bar
         st.info("Stage 2/2 — Building PDF…")
         build_bar = st.progress(0.0)
-        status = st.empty()
-        status.info("Building PDF…")
-        build_bar.progress(0.2)
+        build_line = st.empty()
 
-        pdf_bytes = make_catalog_pdf_bytes(
-            df=df,
-            title=title,
-            orientation=orientation,
-            currency=currency,
-            grid_mode=grid_key,
-            show_price=show_price,
-            show_sku=show_sku,
-            show_desc=show_desc,
-            show_attrs=show_attrs,
-            show_brand_kashrut=True,
-            category_label_mode=category_label_mode,
-        )
+        st.session_state["pdf_build_done"] = 0
+        st.session_state["pdf_build_total"] = int(len(df))
 
-        build_bar.progress(1.0)
-        status.success("PDF ready.")
+        total_rows = int(len(df))
 
-        if isinstance(pdf_bytes, bytearray):
-            pdf_bytes = bytes(pdf_bytes)
-        elif isinstance(pdf_bytes, str):
-            pdf_bytes = pdf_bytes.encode("latin-1", "ignore")
-        elif not isinstance(pdf_bytes, (bytes,)):
-            pdf_bytes = bytes(pdf_bytes)
+        def update_build_ui() -> None:
+            done = int(st.session_state.get("pdf_build_done", 0) or 0)
+            tot = int(st.session_state.get("pdf_build_total", total_rows) or total_rows)
+            pct = min(done / max(tot, 1), 1.0)
+            build_bar.progress(pct)
+            build_line.markdown(f"**Building:** {done:,} / {tot:,} products (**{pct*100:.1f}%**)")
 
-        st.download_button(
-            "Download PDF",
-            data=pdf_bytes,
-            file_name="bkosher_catalog.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-        st.caption("If links don’t work in your viewer, test in Chrome/Edge — some mobile viewers ignore PDF links.")
+        update_build_ui()
+
+        # If big, split into parts and ZIP (prevents crashes)
+        if total_rows > int(pdf_chunk_size):
+            log(f"Large PDF build detected: {total_rows} rows -> multi-part ZIP.")
+            zip_bytes, filenames = build_pdf_parts_as_zip(
+                df=df,
+                title=title,
+                orientation=orientation,
+                currency=currency,
+                grid_mode=grid_key,
+                show_price=show_price,
+                show_sku=show_sku,
+                show_desc=show_desc,
+                show_attrs=show_attrs,
+                show_brand_kashrut=True,
+                category_label_mode=category_label_mode,
+                chunk_size=int(pdf_chunk_size),
+            )
+            # finish bar
+            st.session_state["pdf_build_done"] = total_rows
+            update_build_ui()
+            build_line.success(f"Built {len(filenames)} PDF parts.")
+
+            st.download_button(
+                "Download ZIP (PDF parts)",
+                data=zip_bytes,
+                file_name="bkosher_catalog_parts.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.caption("For very large catalogs, parts are safest. You can merge them on a PC/Mac if you really need one file.")
+        else:
+            # single PDF build
+            def hook(done_in_part: int, total_in_part: int) -> None:
+                st.session_state["pdf_build_done"] = done_in_part
+                st.session_state["pdf_build_total"] = total_in_part
+                update_build_ui()
+
+            log("Generating single PDF…")
+            pdf_bytes = make_catalog_pdf_bytes(
+                df=df,
+                title=title,
+                orientation=orientation,
+                currency=currency,
+                grid_mode=grid_key,
+                show_price=show_price,
+                show_sku=show_sku,
+                show_desc=show_desc,
+                show_attrs=show_attrs,
+                show_brand_kashrut=True,
+                category_label_mode=category_label_mode,
+                progress_hook=hook,
+            )
+
+            st.session_state["pdf_build_done"] = total_rows
+            update_build_ui()
+            build_line.success("PDF ready.")
+
+            if isinstance(pdf_bytes, bytearray):
+                pdf_bytes = bytes(pdf_bytes)
+            elif isinstance(pdf_bytes, str):
+                pdf_bytes = pdf_bytes.encode("latin-1", "ignore")
+            elif not isinstance(pdf_bytes, (bytes,)):
+                pdf_bytes = bytes(pdf_bytes)
+
+            st.download_button(
+                "Download PDF",
+                data=pdf_bytes,
+                file_name="bkosher_catalog.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+            st.caption("If links don’t work in your viewer, test in Chrome/Edge — some mobile viewers ignore PDF links.")
 
     st.caption("Done.")
 
