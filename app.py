@@ -390,7 +390,7 @@ def resumable_fetch_products(
     cs: str,
     timeout: int,
     include_private: bool,
-    per_page: int = 25,
+    per_page: int = 100,
     max_pages_per_run: int = 6,
     retries: int = 5,
 ) -> WCFetchResult:
