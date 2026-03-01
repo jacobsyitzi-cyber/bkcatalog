@@ -1249,9 +1249,10 @@ def main():
                 st.stop()
 
             # ✅ Continuous progress: auto-refresh until done
-            if st.session_state.get("importing") and not finished:
-                st.info("Import in progress… auto-refreshing.")
-                st.autorefresh(interval=1200, key=f"autoimport_{status_key}")
+          if st.session_state.get("importing") and not finished:
+    st.info("Import in progress… continuing…")
+    time.sleep(0.4)
+    st.rerun()
 
         # Load dataframe only when finished (fast UI while importing)
         meta = read_meta(status_key)
